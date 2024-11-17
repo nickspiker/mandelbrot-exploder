@@ -30,10 +30,17 @@ struct MandelbrotBuffer {
     calculation_thread: Option<thread::JoinHandle<()>>,
     shift_held: bool,
     transform_requested: bool,
+    boundary_path: Vec<Complex64>,
 }
 
 impl MandelbrotBuffer {
-    fn new(width: usize, height: usize) -> Self {
+    fn new(
+        width: usize,
+        height: usize,
+        center: Complex64,
+        zoom: Complex64,
+        boundary_path: Vec<Complex64>,
+    ) -> Self {
         let size = width * height;
         let buffer = Self {
             pixel_buffer: vec![0; size * 4],
@@ -47,8 +54,8 @@ impl MandelbrotBuffer {
             ])),
             width,
             height,
-            center: Complex64::new(-1., 0.),
-            zoom: Complex64::new(0.25, 0.),
+            center,
+            zoom,
             old_width: width,
             old_height: height,
             old_center: Complex64::new(0., 0.),
@@ -57,11 +64,13 @@ impl MandelbrotBuffer {
             calculation_thread: None,
             shift_held: false,
             transform_requested: false,
+            boundary_path,
         };
         buffer
     }
 
     fn interpolate_pixels(&mut self) {
+        self.plot_boundary_path();
         // Up-down pass second
         for x in 3..self.width - 3 {
             for y in 3..self.height - 3 {
@@ -359,19 +368,11 @@ impl MandelbrotBuffer {
                 let point =
                     Self::screen_to_complex(x, y, width as f64, height as f64, zoom, center);
 
-                let (is_inside, period, escape_velocity, coords, flames, slope) =
+                let (period, escape_velocity, coords, flames, slope) =
                     calculate_mandelbrot_point(point, MAX_ITERATIONS);
 
-                let colour = calculate_colour(
-                    point,
-                    is_inside,
-                    period,
-                    escape_velocity,
-                    coords,
-                    flames,
-                    slope,
-                    zoom,
-                );
+                let colour =
+                    calculate_colour(point, period, escape_velocity, coords, flames, slope, zoom);
 
                 if let Ok(mut pixels) = shared_colours.lock().or_else(|poisoned| {
                     Ok::<
@@ -402,10 +403,131 @@ impl MandelbrotBuffer {
     fn stop_calculation(&mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
     }
+
+    fn format_point_statistics(
+        point: Complex64,
+        zoom: Complex64,
+        period: u64,
+        escape_velocity: f64,
+        coords: Complex64,
+        flames: Complex64,
+        slope: Complex64,
+    ) -> String {
+        if period == 0 {
+            format!(
+                "Outside point: [{}, {}]\n\
+                 Zoom: [{}, {}]\n\
+                 Escape velocity: {}\n\
+                 Coordinates: [{}, {}]\n\
+                 Flame coords: [{}, {}]\n\
+                 Slope: [{}, {}]",
+                point.re,
+                point.im,
+                zoom.re,
+                zoom.im,
+                escape_velocity,
+                coords.re,
+                coords.im,
+                flames.re,
+                flames.im,
+                slope.re,
+                slope.im
+            )
+        } else {
+            format!(
+                "Inside point: [{}, {}]\n\
+                Zoom: [{}, {}]\n\
+                Period: {}\n\
+                Coordinates: [{}, {}]\n\
+                Flame coords: [{}, {}]\n\
+                Slope: [{}, {}]",
+                point.re,
+                point.im,
+                zoom.re,
+                zoom.im,
+                period,
+                coords.re,
+                coords.im,
+                flames.re,
+                flames.im,
+                slope.re,
+                slope.im
+            )
+        }
+    }
+    fn plot_boundary_path(&mut self) {
+        let scale = ((self.width * self.width + self.height * self.height) as f64).sqrt();
+
+        for point in self.boundary_path.iter() {
+            let (x, y) = Self::complex_to_screen(
+                *point,
+                self.width as f64,
+                self.height as f64,
+                self.zoom,
+                self.center,
+                scale,
+            );
+
+            let xi = x.floor() as isize;
+            let yi = y.floor() as isize;
+
+            // Check if the point is within the buffer bounds
+            if xi >= 0 && xi < self.width as isize && yi >= 0 && yi < self.height as isize {
+                let idx = (yi as usize * self.width + xi as usize) * 4;
+                self.pixel_buffer[idx] = 255; // R
+                self.pixel_buffer[idx + 1] = 255; // G
+                self.pixel_buffer[idx + 2] = 255; // B
+                self.pixel_buffer[idx + 3] = 255; // A
+            }
+        }
+    }
 }
 
-// Update main() to use the new implementation:
+fn random_unit_complex() -> Complex64 {
+    let mut rng = rand::thread_rng();
+    loop {
+        // Generate random point in [-1,1] × [-1,1]
+        let re = rng.gen_range(-1.0..=1.0);
+        let im = rng.gen_range(-1.0..=1.0);
+        let mag_sq = re * re + im * im;
+
+        // If inside unit circle, normalize and return
+        if mag_sq <= 1.0 {
+            let mag = mag_sq.sqrt();
+            return Complex64::new(re / mag, im / mag); // Scale to radius 2 (outside Mandelbrot set)
+        }
+        // Otherwise try again
+    }
+}
+
+fn roll_to_boundary() -> (Vec<Complex64>, Complex64) {
+    let random = random_unit_complex();
+    let mut point = random * 65536.;
+    let mut path = vec![point];
+    let mut previous_point = point;
+    let mut dist = Complex64::new(0., 0.);
+
+    loop {
+        let (period, _escape_velocity, _coords, _flames, slope) =
+            calculate_mandelbrot_point(point, MAX_ITERATIONS);
+        if period != 0 {
+            break;
+        }
+
+        point = point + Complex::new(-(slope.re), slope.im) / 256.;
+        path.push(point);
+        if point == previous_point {
+            break;
+        }
+        dist = point - previous_point;
+        previous_point = point;
+    }
+    (path, dist * random)
+}
+
 fn main() -> Result<(), Error> {
+    let (boundary_path, distance) = roll_to_boundary();
+
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new()
         .with_title("Mandelbrot Exploder")
@@ -422,7 +544,15 @@ fn main() -> Result<(), Error> {
         Pixels::new(window_size.width, window_size.height, surface_texture)?
     };
 
-    let mut buffer = MandelbrotBuffer::new(window_size.width as usize, window_size.height as usize);
+    let width = window_size.width as usize;
+    let height = window_size.height as usize;
+    let mut buffer = MandelbrotBuffer::new(
+        width,
+        height,
+        boundary_path[boundary_path.len() - 1],
+        1. / (distance * ((width * width + height * height) as f64).sqrt() * 256.),
+        boundary_path,
+    );
     buffer.start_z_iterations();
     let mut cursor_pos = PhysicalPosition::new(0., 0.);
     let mut accumulated_zoom = 0.;
@@ -472,8 +602,32 @@ fn main() -> Result<(), Error> {
                     },
                 ..
             } => {
+                let point = MandelbrotBuffer::screen_to_complex(
+                    cursor_pos.x,
+                    cursor_pos.y,
+                    buffer.width as f64,
+                    buffer.height as f64,
+                    buffer.zoom,
+                    buffer.center,
+                );
+
+                let (period, escape_velocity, coords, flames, slope) =
+                    calculate_mandelbrot_point(point, MAX_ITERATIONS);
+
+                println!(
+                    "\n{}",
+                    MandelbrotBuffer::format_point_statistics(
+                        point,
+                        buffer.zoom,
+                        period,
+                        escape_velocity,
+                        coords,
+                        flames,
+                        slope
+                    )
+                );
                 buffer.set_center(cursor_pos);
-                println!("Center set to [{},{}]", buffer.center.re, buffer.center.im);
+
                 buffer.transform_requested = true;
             }
 
@@ -563,7 +717,7 @@ fn main() -> Result<(), Error> {
 fn calculate_mandelbrot_point(
     point: Complex<f64>,
     max_iterations: u64,
-) -> (bool, u64, f64, Complex<f64>, Complex<f64>, Complex<f64>) {
+) -> (u64, f64, Complex<f64>, Complex<f64>, Complex<f64>) {
     let mut is_inside = false;
     let point_re = point.re;
     let point_im = point.im;
@@ -584,7 +738,7 @@ fn calculate_mandelbrot_point(
     let mut z_min = f64::MAX;
 
     const MAX_NEWTON_STEPS: isize = 32;
-    let epsilon_squared = 2f64.powi(-53); // Moved from const to let
+    let epsilon_squared = 2f64.powi(-57); // Moved from const to let
 
     let mut has_converged = false;
 
@@ -747,18 +901,10 @@ fn calculate_mandelbrot_point(
         }
     }
 
-    (
-        is_inside,
-        period,
-        escape_velocity,
-        coordinates,
-        flame_coords,
-        slope,
-    )
+    (period, escape_velocity, coordinates, flame_coords, slope)
 }
 fn calculate_colour(
     point: Complex<f64>,
-    is_inside: bool,
     period: u64,
     escape_velocity: f64,
     coordinates: Complex<f64>,
@@ -766,88 +912,72 @@ fn calculate_colour(
     slope: Complex<f64>,
     zoom: Complex<f64>,
 ) -> [u8; 4] {
-    let mut red:f64;
-    let mut green:f64;
-    let mut blue:f64;
+    let mut red: f64;
+    let mut green: f64;
+    let mut blue: f64;
+    if period != 0 {
+        // initial solid colouring
+        let mut hash = period;
+        hash = hash.rotate_left(2);
+        hash ^= period;
+        hash = hash.wrapping_mul(2381);
+        hash = hash.wrapping_mul(hash + 13);
+        red = (hash % 6229) as f64 / 6229.;
+        hash = hash.rotate_left(3);
+        hash ^= period;
+        hash = hash.wrapping_mul(37);
+        hash = hash.wrapping_mul(hash + 17);
+        green = (hash % 6247) as f64 / 6247.;
+        hash = hash.rotate_left(5);
+        hash ^= period;
+        hash = hash.wrapping_mul(43);
+        hash = hash.wrapping_mul(hash + 3169);
+        blue = (hash % 6271) as f64 / 6271.;
 
-    let inspect = -flames.re() / 2. + 0.5;
+        // coordinate shading
+        let (_mag, mut angle) = coordinates.to_polar();
+        let magnitude = coordinates.norm_sqr();
+        hash = hash.wrapping_mul(67);
+        hash = hash.wrapping_mul(hash + 12153);
+        let step = hash % 7 + 1;
+        hash = hash.wrapping_mul(73);
+        let spiral_scale = (hash % 5) as f64 - 2.;
+        hash = hash.wrapping_mul(897);
+        hash = hash.wrapping_mul(hash + 5);
+        let x = (hash % 118741) as f64 / 118741.;
+        let ripples = ((1. - x).ln() * magnitude * 8.).sin() / 4. + 0.75;
 
-    let angle_120 = Complex::new(-0.5, 0.75f64.sqrt());
-    let angle_240 = Complex::new(-0.5, -(0.75f64.sqrt()));
-
-     red = (1. / slope.norm()).log2().sin() / 2. + 0.5;
-     blue = escape_velocity.sqrt().sin() / 2. + 0.5;
-     green = flames.re() / 2. + 0.5;
-
-
-    let red_byte = (red.max(0.).sqrt() * 256.) as u8;
-    let green_byte = (green.max(0.).sqrt() * 256.) as u8;
-    let blue_byte = (blue.max(0.).sqrt() * 256.) as u8;
-
-    [red_byte, green_byte, blue_byte, 255]
-}
-/// Converts Mandelbrot set properties into RGBA gamma 2 colour values
-///
-/// # Arguments
-/// * `is_inside` - Whether the point is in the Mandelbrot set
-/// * `period` - Orbit period for points in the set
-/// * `escape_velocity` - Rate of escape for points outside the set
-/// * `coordinates` - Position information for colouring
-/// * `flames` - Additional coordinate information for colouring effects
-/// * `slope` - Derivative information for shading
-/// * `rotation` - Current view transformation for consistent colouring
-///
-/// # Returns
-/// * `[u8; 4]` - RGBA colour values as bytes
-fn _calculate_colour(
-    point: Complex64,
-    is_inside: bool,
-    period: u64,
-    escape_velocity: f64,
-    coordinates: Complex64,
-    flames: Complex64,
-    slope: Complex64,
-    zoom: Complex64,
-) -> [u8; 4] {
-    let mut red;
-    let mut green;
-    let mut blue;
-
-    if is_inside {
-        // Constants for 120° colour rotation
-        let angle_120 = Complex64::new(-0.5, 0.75f64.sqrt());
-        let angle_240 = Complex64::new(-0.5, -(0.75f64.sqrt()));
-        let mut mag_sq = coordinates.norm_sqr();
-        mag_sq = mag_sq * mag_sq;
-        mag_sq = mag_sq * mag_sq;
-
-        // Generate RGB components through 120° rotations
-        red = (coordinates.re + 1.) / 2.;
-        green = ((coordinates * angle_120).re + 1.) / 2.;
-        blue = ((coordinates * angle_240).re + 1.) / 2.;
-
-        red = red * (1. - mag_sq);
-        green = green * (1. - mag_sq);
-        blue = blue * (1. - mag_sq);
+        angle = (angle - magnitude * spiral_scale) * step as f64;
+        red = ((Complex::from_polar(magnitude, angle)).re + 1.) / 2. * magnitude
+            + (1. - magnitude) * red;
+        green = ((Complex::from_polar(magnitude, angle + std::f64::consts::FRAC_PI_3 * 2.)).re
+            + 1.)
+            / 2.
+            * magnitude
+            + (1. - magnitude) * green;
+        blue = ((Complex::from_polar(magnitude, angle - std::f64::consts::FRAC_PI_3 * 2.)).re + 1.)
+            / 2.
+            * magnitude
+            + (1. - magnitude) * blue;
+        let taper = (1. - (magnitude.powi(step as i32 + 1))) * ripples;
+        red *= taper;
+        green *= taper;
+        blue *= taper;
     } else {
-        // Constants for 120° colour rotation
-        let angle_120 = Complex64::new(-0.5, 0.75f64.sqrt());
-        let angle_240 = Complex64::new(-0.5, -(0.75f64.sqrt()));
-        let scale = 1. / slope.norm();
+        let coordinates_norm = coordinates.norm();
+        let coordinates_sign = coordinates / coordinates_norm;
+        let flames_scaled =
+            coordinates_norm.atan() * coordinates_sign * (1. / slope.norm()).log2() * 2.
+                - flames * escape_velocity.sqrt();
+        red = (flames_scaled * Complex::new(-0.0732, -0.1847)).re;
+        green = (flames_scaled * Complex::new(0.113, 0.0378)).re;
+        blue = (flames_scaled * Complex::new(-0.2134, 0.1756)).re;
 
-        let intensity = slope.norm().log2().sin() / 2. + 1.;
-        // Generate RGB components through 120° rotations
-        red = (slope.re * scale + 1.) / 8. * intensity;
-        green = ((slope * angle_120 * scale).re + 1.) / 8. * intensity;
-        blue = ((slope * angle_240 * scale).re + 1.) / 8. * intensity;
-
-        let flame_scale = 0.5 / flames.norm();
-        red = (flames.re * flame_scale + 1.) * red;
-        green = ((flames * angle_120 * flame_scale).re + 1.) * green;
-        blue = ((flames * angle_240 * flame_scale).re + 1.) * blue;
+        red = (escape_velocity.sqrt() + red).sin() / 2. + 0.5;
+        green = (escape_velocity.sqrt() + green).sin() / 2. + 0.5;
+        blue = (escape_velocity.sqrt() + blue).sin() / 2. + 0.5;
     }
 
-    // Convert to 8-bit colour with gamma correction and bounds checking
     let red_byte = (red.max(0.).sqrt() * 256.) as u8;
     let green_byte = (green.max(0.).sqrt() * 256.) as u8;
     let blue_byte = (blue.max(0.).sqrt() * 256.) as u8;
