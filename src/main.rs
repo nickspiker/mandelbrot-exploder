@@ -1,315 +1,432 @@
 use num_complex::*;
 use pixels::{Error, Pixels, SurfaceTexture};
-use rand::Rng;
+use rand::prelude::*;
 use rayon::prelude::*;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::thread;
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, Event, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::window::WindowBuilder;
 
 const MAX_ITERATIONS: u64 = 1 << 24;
-const INITIAL_WIDTH: u32 = 0x400;
-const INITIAL_HEIGHT: u32 = 0x200;
-
-/// Holds both the display buffer and the corresponding complex coordinates
+const INITIAL_WIDTH: usize = 0x400;
+const INITIAL_HEIGHT: usize = 0x400;
 struct MandelbrotBuffer {
-    /// RGBA pixels for display
-    pixels: Vec<u8>,
-    /// Complex coordinates corresponding to each pixel actual location
-    coordinates: Vec<Complex64>,
-    width: u32,
-    height: u32,
-    /// Center point of the current view
+    pixel_buffer: Vec<u8>,
+    shared_colours: Arc<Mutex<Vec<u8>>>,
+    shared_coordinates: Arc<Mutex<Vec<Complex64>>>,
+    width: usize,
+    height: usize,
     center: Complex64,
-    /// Current zoom level (complex number to include rotation)
     zoom: Complex64,
-    calculated: AtomicU32,
-    /// Flags to indicate if a redraw is needed
-    view_changed: bool,
-    /// Accumulated deltas
-    accumulated_zoom_delta: f64,
-    accumulated_rotation_delta: f64,
-    /// Shift key state
+    old_width: usize,
+    old_height: usize,
+    old_center: Complex64,
+    old_zoom: Complex64,
+    stop_flag: Arc<AtomicBool>,
+    calculation_thread: Option<thread::JoinHandle<()>>,
     shift_held: bool,
+    transform_requested: bool,
 }
 
 impl MandelbrotBuffer {
-    fn new(width: u32, height: u32) -> Self {
-        let size = (width * height) as usize;
-        Self {
-            pixels: vec![0; size * 4],
-            coordinates: vec![Complex64::new(0., 0.); size],
+    fn new(width: usize, height: usize) -> Self {
+        let size = width * height;
+        let buffer = Self {
+            pixel_buffer: vec![0; size * 4],
+            shared_colours: Arc::new(Mutex::new(vec![0; size * 4])),
+            shared_coordinates: Arc::new(Mutex::new(vec![
+                Complex64::new(
+                    std::f64::NAN,
+                    std::f64::NAN
+                );
+                size
+            ])),
             width,
             height,
-            center: Complex64::new(0., 0.),
-            zoom: Complex64::new(1., 0.),
-            calculated: AtomicU32::new(0),
-            view_changed: true,
-            accumulated_zoom_delta: 0.,
-            accumulated_rotation_delta: 0.,
+            center: Complex64::new(-1., 0.),
+            zoom: Complex64::new(0.25, 0.),
+            old_width: width,
+            old_height: height,
+            old_center: Complex64::new(0., 0.),
+            old_zoom: Complex64::new(1., 0.),
+            stop_flag: Arc::new(AtomicBool::new(false)),
+            calculation_thread: None,
             shift_held: false,
+            transform_requested: false,
+        };
+        buffer
+    }
+
+    fn interpolate_pixels(&mut self) {
+        // Up-down pass second
+        for x in 3..self.width - 3 {
+            for y in 3..self.height - 3 {
+                let idx = y * self.width * 4 + x * 4;
+
+                // Skip if this pixel is already set
+                if self.pixel_buffer[idx + 3] > 253 {
+                    continue;
+                }
+
+                if self.pixel_buffer[idx - 4 + 3] == 255 {
+                    self.pixel_buffer[idx] = self.pixel_buffer[idx - 4];
+                    self.pixel_buffer[idx + 1] = self.pixel_buffer[idx - 4 + 1];
+                    self.pixel_buffer[idx + 2] = self.pixel_buffer[idx - 4 + 2];
+                    self.pixel_buffer[idx + 3] = 254;
+                } else if self.pixel_buffer[idx + 4 + 3] == 255 {
+                    self.pixel_buffer[idx] = self.pixel_buffer[idx + 4];
+                    self.pixel_buffer[idx + 1] = self.pixel_buffer[idx + 4 + 1];
+                    self.pixel_buffer[idx + 2] = self.pixel_buffer[idx + 4 + 2];
+                    self.pixel_buffer[idx + 3] = 254;
+                } else if self.pixel_buffer[idx - self.width * 4 + 3] == 255 {
+                    self.pixel_buffer[idx] = self.pixel_buffer[idx - self.width * 4];
+                    self.pixel_buffer[idx + 1] = self.pixel_buffer[idx - self.width * 4 + 1];
+                    self.pixel_buffer[idx + 2] = self.pixel_buffer[idx - self.width * 4 + 2];
+                    self.pixel_buffer[idx + 3] = 254;
+                } else if self.pixel_buffer[idx + self.width * 4 + 3] == 255 {
+                    self.pixel_buffer[idx] = self.pixel_buffer[idx + self.width * 4];
+                    self.pixel_buffer[idx + 1] = self.pixel_buffer[idx + self.width * 4 + 1];
+                    self.pixel_buffer[idx + 2] = self.pixel_buffer[idx + self.width * 4 + 2];
+                    self.pixel_buffer[idx + 3] = 254;
+                } else if self.pixel_buffer[idx - self.width * 4 - 4 + 3] == 255 {
+                    self.pixel_buffer[idx] = self.pixel_buffer[idx - self.width * 4 - 4];
+                    self.pixel_buffer[idx + 1] = self.pixel_buffer[idx - self.width * 4 - 4 + 1];
+                    self.pixel_buffer[idx + 2] = self.pixel_buffer[idx - self.width * 4 - 4 + 2];
+                    self.pixel_buffer[idx + 3] = 254;
+                } else if self.pixel_buffer[idx - self.width * 4 + 4 + 3] == 255 {
+                    self.pixel_buffer[idx] = self.pixel_buffer[idx - self.width * 4 + 4];
+                    self.pixel_buffer[idx + 1] = self.pixel_buffer[idx - self.width * 4 + 4 + 1];
+                    self.pixel_buffer[idx + 2] = self.pixel_buffer[idx - self.width * 4 + 4 + 2];
+                    self.pixel_buffer[idx + 3] = 254;
+                } else if self.pixel_buffer[idx + self.width * 4 - 4 + 3] == 255 {
+                    self.pixel_buffer[idx] = self.pixel_buffer[idx + self.width * 4 - 4];
+                    self.pixel_buffer[idx + 1] = self.pixel_buffer[idx + self.width * 4 - 4 + 1];
+                    self.pixel_buffer[idx + 2] = self.pixel_buffer[idx + self.width * 4 - 4 + 2];
+                    self.pixel_buffer[idx + 3] = 254;
+                } else if self.pixel_buffer[idx + self.width * 4 + 4 + 3] == 255 {
+                    self.pixel_buffer[idx] = self.pixel_buffer[idx + self.width * 4 + 4];
+                    self.pixel_buffer[idx + 1] = self.pixel_buffer[idx + self.width * 4 + 4 + 1];
+                    self.pixel_buffer[idx + 2] = self.pixel_buffer[idx + self.width * 4 + 4 + 2];
+                    self.pixel_buffer[idx + 3] = 254;
+                } else if self.pixel_buffer[idx - 8 + 3] == 255 {
+                    self.pixel_buffer[idx] = self.pixel_buffer[idx - 8];
+                    self.pixel_buffer[idx + 1] = self.pixel_buffer[idx - 8 + 1];
+                    self.pixel_buffer[idx + 2] = self.pixel_buffer[idx - 8 + 2];
+                    self.pixel_buffer[idx + 3] = 254;
+                } else if self.pixel_buffer[idx + 8 + 3] == 255 {
+                    self.pixel_buffer[idx] = self.pixel_buffer[idx + 8];
+                    self.pixel_buffer[idx + 1] = self.pixel_buffer[idx + 8 + 1];
+                    self.pixel_buffer[idx + 2] = self.pixel_buffer[idx + 8 + 2];
+                    self.pixel_buffer[idx + 3] = 254;
+                } else if self.pixel_buffer[idx - self.width * 8 + 3] == 255 {
+                    self.pixel_buffer[idx] = self.pixel_buffer[idx - self.width * 8];
+                    self.pixel_buffer[idx + 1] = self.pixel_buffer[idx - self.width * 8 + 1];
+                    self.pixel_buffer[idx + 2] = self.pixel_buffer[idx - self.width * 8 + 2];
+                    self.pixel_buffer[idx + 3] = 254;
+                } else if self.pixel_buffer[idx + self.width * 8 + 3] == 255 {
+                    self.pixel_buffer[idx] = self.pixel_buffer[idx + self.width * 8];
+                    self.pixel_buffer[idx + 1] = self.pixel_buffer[idx + self.width * 8 + 1];
+                    self.pixel_buffer[idx + 2] = self.pixel_buffer[idx + self.width * 8 + 2];
+                    self.pixel_buffer[idx + 3] = 254;
+                } else if self.pixel_buffer[idx - 8 - self.width * 4 + 3] == 255 {
+                    self.pixel_buffer[idx] = self.pixel_buffer[idx - 8 - self.width * 4];
+                    self.pixel_buffer[idx + 1] = self.pixel_buffer[idx - 8 - self.width * 4 + 1];
+                    self.pixel_buffer[idx + 2] = self.pixel_buffer[idx - 8 - self.width * 4 + 2];
+                    self.pixel_buffer[idx + 3] = 254;
+                } else if self.pixel_buffer[idx - 8 + self.width * 4 + 3] == 255 {
+                    self.pixel_buffer[idx] = self.pixel_buffer[idx - 8 + self.width * 4];
+                    self.pixel_buffer[idx + 1] = self.pixel_buffer[idx - 8 + self.width * 4 + 1];
+                    self.pixel_buffer[idx + 2] = self.pixel_buffer[idx - 8 + self.width * 4 + 2];
+                    self.pixel_buffer[idx + 3] = 254;
+                } else if self.pixel_buffer[idx + 8 - self.width * 4 + 3] == 255 {
+                    self.pixel_buffer[idx] = self.pixel_buffer[idx + 8 - self.width * 4];
+                    self.pixel_buffer[idx + 1] = self.pixel_buffer[idx + 8 - self.width * 4 + 1];
+                    self.pixel_buffer[idx + 2] = self.pixel_buffer[idx + 8 - self.width * 4 + 2];
+                    self.pixel_buffer[idx + 3] = 254;
+                } else if self.pixel_buffer[idx + 8 + self.width * 4 + 3] == 255 {
+                    self.pixel_buffer[idx] = self.pixel_buffer[idx + 8 + self.width * 4];
+                    self.pixel_buffer[idx + 1] = self.pixel_buffer[idx + 8 + self.width * 4 + 1];
+                    self.pixel_buffer[idx + 2] = self.pixel_buffer[idx + 8 + self.width * 4 + 2];
+                    self.pixel_buffer[idx + 3] = 254;
+                } else if self.pixel_buffer[idx - 4 - self.width * 8 + 3] == 255 {
+                    self.pixel_buffer[idx] = self.pixel_buffer[idx - 4 - self.width * 8];
+                    self.pixel_buffer[idx + 1] = self.pixel_buffer[idx - 4 - self.width * 8 + 1];
+                    self.pixel_buffer[idx + 2] = self.pixel_buffer[idx - 4 - self.width * 8 + 2];
+                    self.pixel_buffer[idx + 3] = 254;
+                } else if self.pixel_buffer[idx - 4 + self.width * 8 + 3] == 255 {
+                    self.pixel_buffer[idx] = self.pixel_buffer[idx - 4 + self.width * 8];
+                    self.pixel_buffer[idx + 1] = self.pixel_buffer[idx - 4 + self.width * 8 + 1];
+                    self.pixel_buffer[idx + 2] = self.pixel_buffer[idx - 4 + self.width * 8 + 2];
+                    self.pixel_buffer[idx + 3] = 254;
+                } else if self.pixel_buffer[idx + 4 - self.width * 8 + 3] == 255 {
+                    self.pixel_buffer[idx] = self.pixel_buffer[idx + 4 - self.width * 8];
+                    self.pixel_buffer[idx + 1] = self.pixel_buffer[idx + 4 - self.width * 8 + 1];
+                    self.pixel_buffer[idx + 2] = self.pixel_buffer[idx + 4 - self.width * 8 + 2];
+                    self.pixel_buffer[idx + 3] = 254;
+                } else if self.pixel_buffer[idx + 4 + self.width * 8 + 3] == 255 {
+                    self.pixel_buffer[idx] = self.pixel_buffer[idx + 4 + self.width * 8];
+                    self.pixel_buffer[idx + 1] = self.pixel_buffer[idx + 4 + self.width * 8 + 1];
+                    self.pixel_buffer[idx + 2] = self.pixel_buffer[idx + 4 + self.width * 8 + 2];
+                    self.pixel_buffer[idx + 3] = 254;
+                }
+            }
         }
     }
 
-    fn calculate_pixels(&mut self) -> bool {
-        if !self.view_changed {
-            return false;
-        }
-        self.view_changed = false;
+    fn transform_buffer(&mut self) {
+        let old_colors = self.shared_colours.lock().unwrap().clone();
+        let old_coords = self.shared_coordinates.lock().unwrap().clone();
+        let mut new_colors = vec![0; self.width * self.height * 4];
+        let mut new_coords =
+            vec![Complex64::new(std::f64::NAN, std::f64::NAN); self.width * self.height];
+        let scale = ((self.width * self.width + self.height * self.height) as f64).sqrt();
 
-        let size = (self.width * self.height) as usize;
+        for y in 0..self.old_height {
+            for x in 0..self.old_width {
+                let old_coord_idx = y * self.old_width + x;
+                let old_colour_idx = old_coord_idx * 4;
 
-        // First pass: collect points to calculate
-        let points: Vec<(usize, Complex64)> = (0..size)
-            .filter(|&idx| self.needs_calculation(idx))
-            .map(|idx| {
-                let mut rng = rand::thread_rng();
-                let x = (idx % self.width as usize) as f64;
-                let y = (idx / self.width as usize) as f64;
-                let x_offset = rng.gen::<f64>();
-                let y_offset = rng.gen::<f64>();
-                (idx, self.screen_to_complex(x + x_offset, y + y_offset))
-            })
-            .collect();
+                if old_colors[old_colour_idx + 3] == 255 {
+                    let coord = old_coords[old_coord_idx];
 
-        if points.is_empty() {
-            return false;
-        }
+                    let (new_x, new_y) = Self::complex_to_screen(
+                        coord,
+                        self.width as f64,
+                        self.height as f64,
+                        self.zoom,
+                        self.center,
+                        scale,
+                    );
 
-        // Second pass: parallel calculation
-        let results: Vec<_> = points
-            .par_iter()
-            .map(|&(idx, point)| {
-                let (is_inside, period, escape_velocity, coordinates, flames, slope) =
-                    calculate_mandelbrot_point(point, MAX_ITERATIONS);
+                    let new_xi = new_x.floor() as isize;
+                    let new_yi = new_y.floor() as isize;
 
-                let color = calculate_colour(
-                    is_inside,
-                    period,
-                    escape_velocity,
-                    coordinates,
-                    flames,
-                    slope,
-                    self.zoom / self.zoom.norm(),
-                );
-
-                (idx, point, color)
-            })
-            .collect();
-
-        // Third pass: update buffers
-        for (idx, point, color) in results {
-            self.coordinates[idx] = point;
-            let pixel_start = idx * 4;
-            self.pixels[pixel_start..pixel_start + 4].copy_from_slice(&color);
-            self.calculated.fetch_add(1, Ordering::Relaxed);
+                    if new_xi >= 0
+                        && new_xi < self.width as isize
+                        && new_yi >= 0
+                        && new_yi < self.height as isize
+                    {
+                        let new_coord_idx = new_yi as usize * self.width + new_xi as usize;
+                        let new_colour_idx = new_coord_idx * 4;
+                        new_colors[new_colour_idx] = old_colors[old_colour_idx];
+                        new_colors[new_colour_idx + 1] = old_colors[old_colour_idx + 1];
+                        new_colors[new_colour_idx + 2] = old_colors[old_colour_idx + 2];
+                        new_colors[new_colour_idx + 3] = 255;
+                        new_coords[new_coord_idx] = coord;
+                    }
+                }
+            }
         }
 
-        true
+        *self.shared_colours.lock().unwrap() = new_colors.clone();
+        *self.shared_coordinates.lock().unwrap() = new_coords;
+        self.pixel_buffer = new_colors;
+        self.old_width = self.width;
+        self.old_height = self.height;
+        self.old_center = self.center;
+        self.old_zoom = self.zoom;
     }
 
-    fn needs_calculation(&self, index: usize) -> bool {
-        self.pixels[index * 4 + 3] != 255
+    fn screen_to_complex(
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        zoom: Complex64,
+        center: Complex64,
+    ) -> Complex64 {
+        let scale = 1. / (width * width + height * height).sqrt();
+
+        let mut re = (x - width / 2.) * scale;
+        let mut im = (y - height / 2.) * scale;
+
+        re = re.tan() * 2.;
+        im = im.tan() * 2.;
+
+        (Complex64::new(re, im) / zoom) + center
     }
+    fn complex_to_screen(
+        c: Complex64,
+        width: f64,
+        height: f64,
+        zoom: Complex64,
+        center: Complex64,
+        scale: f64,
+    ) -> (f64, f64) {
+        let c_transformed = (c - center) * zoom;
+        let mut re = c_transformed.re;
+        let mut im = c_transformed.im;
 
-    fn screen_to_complex(&self, x: f64, y: f64) -> Complex64 {
-        // Use screen diagonal for consistent scaling
-        let diagonal = (self.width as f64 * self.width as f64
-            + self.height as f64 * self.height as f64)
-            .sqrt();
+        re = (re * 0.5).atan();
+        im = (im * 0.5).atan();
 
-        // Convert to -1 to 1 range using diagonal scale
-        let screen_x = (x - self.width as f64 / 2.) / (diagonal / 2.);
-        let screen_y = (y - self.height as f64 / 2.) / (diagonal / 2.);
-
-        // Apply complex zoom transform and center offset
-        (Complex64::new(screen_x, screen_y) / self.zoom) + self.center
-    }
-
-    fn complex_to_screen(&self, c: Complex64) -> (f64, f64) {
-        let diagonal = (self.width as f64 * self.width as f64
-            + self.height as f64 * self.height as f64)
-            .sqrt();
-        let transformed = (c - self.center) * self.zoom;
-        let x = transformed.re * (diagonal / 2.) + self.width as f64 / 2.;
-        let y = transformed.im * (diagonal / 2.) + self.height as f64 / 2.;
+        let x = re * scale + width / 2.;
+        let y = im * scale + height / 2.;
         (x, y)
     }
 
-    fn handle_zoom(&mut self, delta: f64, cursor_pos: (f64, f64)) {
-        // Convert cursor position to complex coordinates
-        let cursor_point = self.screen_to_complex(cursor_pos.0, cursor_pos.1);
+    fn apply_zoom(&mut self, cursor_pos: PhysicalPosition<f64>, zoom_delta: f64) {
+        let cursor_coordinates = Self::screen_to_complex(
+            cursor_pos.x,
+            cursor_pos.y,
+            self.width as f64,
+            self.height as f64,
+            self.zoom,
+            self.center,
+        );
 
-        // Calculate zoom factor
-        let zoom_factor = delta;
+        let zoom_factor = if zoom_delta > 0. { 7. / 6. } else { 6. / 7. };
+        let scale = zoom_factor.powf(zoom_delta.abs());
 
-        // Update zoom while preserving rotation
-        self.zoom *= Complex64::new(zoom_factor, 0.);
-
-        // Adjust center point based on cursor position
-        let new_cursor = self.screen_to_complex(cursor_pos.0, cursor_pos.1);
-        self.center += cursor_point - new_cursor;
-
-        // Reset calculation state
-        self.calculated.store(0, Ordering::Relaxed);
-
-        // Preserve and remap existing calculations where possible
-        self.remap_buffer();
-
-        self.view_changed = true;
+        // Update zoom and center (relative to cursor position)
+        self.zoom *= Complex64::new(scale, 0.);
+        self.center = cursor_coordinates + (self.center - cursor_coordinates) / scale;
     }
 
-    fn handle_rotation(&mut self, angle_delta: f64, cursor_pos: (f64, f64)) {
-        // Convert cursor position to complex coordinates
-        let cursor_point = self.screen_to_complex(cursor_pos.0, cursor_pos.1);
+    fn apply_rotation(&mut self, cursor_pos: PhysicalPosition<f64>, rotation_delta: f64) {
+        let cursor_coordinates = Self::screen_to_complex(
+            self.width as f64 - cursor_pos.x,
+            self.height as f64 - cursor_pos.y,
+            self.width as f64,
+            self.height as f64,
+            self.zoom,
+            self.center,
+        );
 
-        // Update zoom with new angle
-        let angle = angle_delta;
-        self.zoom *= Complex64::from_polar(1., angle);
+        let rotation = Complex64::new(rotation_delta.cos(), rotation_delta.sin());
 
-        // Adjust center point based on cursor position
-        let new_cursor = self.screen_to_complex(cursor_pos.0, cursor_pos.1);
-        self.center += cursor_point - new_cursor;
+        // First rotate the zoom factor
+        self.zoom *= rotation;
 
-        // Reset calculation state
-        self.calculated.store(0, Ordering::Relaxed);
+        // Then rotate the center around the cursor
+        self.center = cursor_coordinates + (self.center - cursor_coordinates) * rotation;
+    }
+    fn set_center(&mut self, cursor_pos: PhysicalPosition<f64>) {
+        // Store old center for transform_buffer
+        self.old_center = self.center;
 
-        // Remap existing calculations
-        self.remap_buffer();
-
-        self.view_changed = true;
+        // Set new center based on cursor position
+        self.center = Self::screen_to_complex(
+            cursor_pos.x,
+            cursor_pos.y,
+            self.width as f64,
+            self.height as f64,
+            self.zoom,
+            self.center,
+        );
     }
 
-    fn handle_click(&mut self, x: f64, y: f64) {
-        // Update center to clicked point
-        let clicked_point = self.screen_to_complex(x, y);
-        self.center = clicked_point;
+    fn start_z_iterations(&mut self) {
+        self.stop_calculation();
 
-        // Reset calculation state
-        self.calculated.store(0, Ordering::Relaxed);
+        self.stop_flag.store(false, Ordering::SeqCst);
 
-        // Clear buffer for recalculation
-        self.clear_buffer();
+        let width = self.width;
+        let height = self.height;
+        let zoom = self.zoom;
+        let center = self.center;
+        let shared_colours = Arc::clone(&self.shared_colours);
+        let shared_coordinates = Arc::clone(&self.shared_coordinates);
+        let stop_flag = Arc::clone(&self.stop_flag);
 
-        self.view_changed = true;
-    }
+        let mut indices: Vec<usize> = (0..width * height).collect();
+        indices.shuffle(&mut thread_rng());
 
-    fn remap_buffer(&mut self) {
-        let size = (self.width * self.height) as usize;
-        let mut new_pixels = vec![0; size * 4];
-        let mut new_coordinates = vec![Complex64::new(0., 0.); size];
-
-        // For each point in the old buffer that has been calculated
-        for old_y in 0..self.height {
-            for old_x in 0..self.width {
-                let old_idx = (old_y * self.width + old_x) as usize;
-
-                // Skip if not calculated
-                if self.pixels[old_idx * 4 + 3] != 255 {
-                    continue;
+        self.calculation_thread = Some(thread::spawn(move || {
+            indices.par_iter().for_each(|&idx| {
+                if stop_flag.load(Ordering::SeqCst) {
+                    return;
                 }
 
-                // Get the original complex coordinate for this point
-                let coord = self.coordinates[old_idx];
-
-                // Use the complex_to_screen method for accurate mapping
-                let (new_x_f64, new_y_f64) = self.complex_to_screen(coord);
-                let new_x = new_x_f64 as i32;
-                let new_y = new_y_f64 as i32;
-
-                // Check if point is in new viewport
-                if new_x >= 0
-                    && new_x < self.width as i32
-                    && new_y >= 0
-                    && new_y < self.height as i32
-                {
-                    let new_idx = (new_y * self.width as i32 + new_x) as usize;
-
-                    // Only copy if we haven't already got a value for this pixel
-                    if new_idx < size && new_pixels[new_idx * 4 + 3] == 0 {
-                        // Copy pixel data and coordinate
-                        new_pixels[new_idx * 4..new_idx * 4 + 4]
-                            .copy_from_slice(&self.pixels[old_idx * 4..old_idx * 4 + 4]);
-                        new_coordinates[new_idx] = coord;
-                        self.calculated.fetch_add(1, Ordering::Relaxed);
+                let should_calculate = {
+                    match shared_colours.lock() {
+                        Ok(pixels) => pixels[idx * 4 + 3] != 255,
+                        Err(poisoned) => poisoned.get_ref()[idx * 4 + 3] != 255,
                     }
-                }
-            }
-        }
+                };
 
-        // Update buffers
-        self.pixels = new_pixels;
-        self.coordinates = new_coordinates;
+                if !should_calculate {
+                    return;
+                }
+
+                let mut rng = rand::thread_rng();
+                let x = (idx % width) as f64 + rng.gen::<f64>();
+                let y = (idx / width) as f64 + rng.gen::<f64>();
+                let point =
+                    Self::screen_to_complex(x, y, width as f64, height as f64, zoom, center);
+
+                let (is_inside, period, escape_velocity, coords, flames, slope) =
+                    calculate_mandelbrot_point(point, MAX_ITERATIONS);
+
+                let colour = calculate_colour(
+                    point,
+                    is_inside,
+                    period,
+                    escape_velocity,
+                    coords,
+                    flames,
+                    slope,
+                    zoom,
+                );
+
+                if let Ok(mut pixels) = shared_colours.lock().or_else(|poisoned| {
+                    Ok::<
+                        std::sync::MutexGuard<'_, Vec<u8>>,
+                        std::sync::PoisonError<std::sync::MutexGuard<'_, Vec<u8>>>,
+                    >(poisoned.into_inner())
+                }) {
+                    let pixel_idx = idx * 4;
+                    pixels[pixel_idx] = colour[0]; // Line 382
+                    pixels[pixel_idx + 1] = colour[1];
+                    pixels[pixel_idx + 2] = colour[2];
+                    pixels[pixel_idx + 3] = 255;
+                }
+
+                // Fixed error type specification
+                if let Ok(mut coords) = shared_coordinates.lock().or_else(|poisoned| {
+                    Ok::<
+                        std::sync::MutexGuard<'_, Vec<Complex64>>,
+                        std::sync::PoisonError<std::sync::MutexGuard<'_, Vec<Complex64>>>,
+                    >(poisoned.into_inner())
+                }) {
+                    coords[idx] = point;
+                }
+            });
+        }));
     }
 
-    fn remap_buffer_from(&mut self, old_buffer: &MandelbrotBuffer) {
-        let size = (self.width * self.height) as usize;
-
-        for old_y in 0..old_buffer.height {
-            for old_x in 0..old_buffer.width {
-                let old_idx = (old_y * old_buffer.width + old_x) as usize;
-
-                // Skip if not calculated
-                if old_buffer.pixels[old_idx * 4 + 3] != 255 {
-                    continue;
-                }
-
-                // Get the original complex coordinate for this point
-                let coord = old_buffer.coordinates[old_idx];
-
-                // Use the new buffer's complex_to_screen method for accurate mapping
-                let (new_x_f64, new_y_f64) = self.complex_to_screen(coord);
-                let new_x = new_x_f64 as i32;
-                let new_y = new_y_f64 as i32;
-
-                // Check if point is in new viewport
-                if new_x >= 0
-                    && new_x < self.width as i32
-                    && new_y >= 0
-                    && new_y < self.height as i32
-                {
-                    let new_idx = (new_y * self.width as i32 + new_x) as usize;
-
-                    // Only copy if we haven't already got a value for this pixel
-                    if new_idx < size && self.pixels[new_idx * 4 + 3] == 0 {
-                        // Copy pixel data and coordinate
-                        self.pixels[new_idx * 4..new_idx * 4 + 4]
-                            .copy_from_slice(&old_buffer.pixels[old_idx * 4..old_idx * 4 + 4]);
-                        self.coordinates[new_idx] = coord;
-                        self.calculated.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            }
-        }
-    }
-
-    fn clear_buffer(&mut self) {
-        let size = (self.width * self.height) as usize;
-        self.pixels = vec![0; size * 4];
-        self.coordinates = vec![Complex64::new(0., 0.); size];
-        self.calculated.store(0, Ordering::Relaxed);
+    fn stop_calculation(&mut self) {
+        self.stop_flag.store(true, Ordering::SeqCst);
     }
 }
 
+// Update main() to use the new implementation:
 fn main() -> Result<(), Error> {
     let event_loop = EventLoop::new();
-
     let window = WindowBuilder::new()
         .with_title("Mandelbrot Exploder")
-        .with_inner_size(LogicalSize::new(INITIAL_WIDTH, INITIAL_HEIGHT))
+        .with_inner_size(LogicalSize::new(
+            INITIAL_WIDTH as u32,
+            INITIAL_HEIGHT as u32,
+        ))
         .build(&event_loop)
         .unwrap();
 
     let window_size = window.inner_size();
-
     let mut pixels = {
         let surface_texture = SurfaceTexture::new(window_size.width, window_size.height, &window);
         Pixels::new(window_size.width, window_size.height, surface_texture)?
     };
 
-    let mut buffer = MandelbrotBuffer::new(window_size.width, window_size.height);
+    let mut buffer = MandelbrotBuffer::new(window_size.width as usize, window_size.height as usize);
+    buffer.start_z_iterations();
     let mut cursor_pos = PhysicalPosition::new(0., 0.);
+    let mut accumulated_zoom = 0.;
+    let mut accumulated_rotation = 0.;
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Poll;
@@ -335,16 +452,15 @@ fn main() -> Result<(), Error> {
             } => {
                 let scroll_amount = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y as f64,
-                    MouseScrollDelta::PixelDelta(pos) => pos.y as f64 / 100., // Adjust scaling as needed
+                    MouseScrollDelta::PixelDelta(pos) => pos.y / 50.,
                 };
 
                 if buffer.shift_held {
-                    // Accumulate rotation delta
-                    buffer.accumulated_rotation_delta += scroll_amount;
+                    accumulated_rotation += scroll_amount * -0.1;
                 } else {
-                    // Accumulate zoom delta
-                    buffer.accumulated_zoom_delta += scroll_amount;
+                    accumulated_zoom += scroll_amount;
                 }
+                buffer.transform_requested = true;
             }
 
             Event::WindowEvent {
@@ -356,7 +472,9 @@ fn main() -> Result<(), Error> {
                     },
                 ..
             } => {
-                buffer.handle_click(cursor_pos.x, cursor_pos.y);
+                buffer.set_center(cursor_pos);
+                println!("Center set to [{},{}]", buffer.center.re, buffer.center.im);
+                buffer.transform_requested = true;
             }
 
             Event::WindowEvent {
@@ -370,76 +488,65 @@ fn main() -> Result<(), Error> {
                 event: WindowEvent::Resized(new_size),
                 ..
             } => {
-                if pixels
+                // First resize the pixels buffer/surface
+                pixels
                     .resize_surface(new_size.width, new_size.height)
-                    .is_err()
-                {
-                    *control_flow = ControlFlow::Exit;
-                }
-
-                if pixels
+                    .expect("Failed to resize surface");
+                pixels
                     .resize_buffer(new_size.width, new_size.height)
-                    .is_err()
-                {
-                    *control_flow = ControlFlow::Exit;
-                }
+                    .expect("Failed to resize buffer");
 
-                // Create a new buffer with the new size
-                let mut new_buffer = MandelbrotBuffer::new(new_size.width, new_size.height);
+                // Then update the buffer dimensions
+                buffer.width = new_size.width as usize;
+                buffer.height = new_size.height as usize;
+                buffer.pixel_buffer = vec![0; buffer.width * buffer.height * 4];
 
-                // Copy over the center, zoom, and other relevant state
-                new_buffer.center = buffer.center;
-                new_buffer.zoom = buffer.zoom;
-                new_buffer.shift_held = buffer.shift_held;
-                new_buffer.view_changed = true;
-
-                // Remap existing calculations to the new buffer
-                new_buffer.remap_buffer_from(&buffer);
-
-                // Replace the old buffer with the new one
-                buffer = new_buffer;
-
-                window.request_redraw();
+                buffer.transform_requested = true;
             }
 
             Event::MainEventsCleared => {
-                // Apply accumulated zoom delta
-                if buffer.accumulated_zoom_delta != 0. {
-                    let zoom_factor = if buffer.accumulated_zoom_delta > 0. {
-                        1.1
-                    } else {
-                        0.9
-                    };
-                    buffer.handle_zoom(
-                        zoom_factor.powf(buffer.accumulated_zoom_delta.abs()),
-                        (cursor_pos.x, cursor_pos.y),
-                    );
-                    buffer.accumulated_zoom_delta = 0.;
+                if accumulated_zoom != 0. {
+                    buffer.stop_calculation();
+                    buffer.apply_zoom(cursor_pos, accumulated_zoom);
+                    accumulated_zoom = 0.;
+                    buffer.transform_requested = true;
                 }
 
-                // Apply accumulated rotation delta
-                if buffer.accumulated_rotation_delta != 0. {
-                    let rotation_amount = buffer.accumulated_rotation_delta * 0.05; // Adjust sensitivity as needed
-                    buffer.handle_rotation(rotation_amount, (cursor_pos.x, cursor_pos.y));
-                    buffer.accumulated_rotation_delta = 0.;
+                if accumulated_rotation != 0. {
+                    buffer.stop_calculation();
+                    buffer.apply_rotation(cursor_pos, accumulated_rotation);
+                    accumulated_rotation = 0.;
+                    buffer.transform_requested = true;
                 }
 
-                if buffer.calculate_pixels() {
-                    // Update display
-                    pixels.frame_mut().copy_from_slice(&buffer.pixels);
-                    if pixels.render().is_err() {
-                        *control_flow = ControlFlow::Exit;
-                    }
-
-                    window.request_redraw();
+                if buffer.transform_requested {
+                    buffer.stop_calculation();
+                    buffer.transform_buffer();
+                    buffer.start_z_iterations();
+                    buffer.transform_requested = false;
                 }
+
+                {
+                    let shared_colours = buffer.shared_colours.lock().unwrap();
+                    buffer.pixel_buffer.copy_from_slice(&shared_colours);
+                }
+                buffer.interpolate_pixels();
+
+                let frame = pixels.frame_mut();
+                frame.copy_from_slice(buffer.pixel_buffer.as_slice());
+
+                if let Err(err) = pixels.render() {
+                    eprintln!("pixels.render() failed: {}", err);
+                    *control_flow = ControlFlow::Exit;
+                    return;
+                }
+
+                window.request_redraw();
             }
-
             _ => (),
         }
     });
 }
-
 /// Calculates the Mandelbrot set properties for a given complex point
 ///
 /// # Arguments
@@ -476,7 +583,7 @@ fn calculate_mandelbrot_point(
     let mut orbit_im = 0f64;
     let mut z_min = f64::MAX;
 
-    const MAX_NEWTON_STEPS: i32 = 32;
+    const MAX_NEWTON_STEPS: isize = 32;
     let epsilon_squared = 2f64.powi(-53); // Moved from const to let
 
     let mut has_converged = false;
@@ -649,7 +756,36 @@ fn calculate_mandelbrot_point(
         slope,
     )
 }
+fn calculate_colour(
+    point: Complex<f64>,
+    is_inside: bool,
+    period: u64,
+    escape_velocity: f64,
+    coordinates: Complex<f64>,
+    flames: Complex<f64>,
+    slope: Complex<f64>,
+    zoom: Complex<f64>,
+) -> [u8; 4] {
+    let mut red:f64;
+    let mut green:f64;
+    let mut blue:f64;
 
+    let inspect = -flames.re() / 2. + 0.5;
+
+    let angle_120 = Complex::new(-0.5, 0.75f64.sqrt());
+    let angle_240 = Complex::new(-0.5, -(0.75f64.sqrt()));
+
+     red = (1. / slope.norm()).log2().sin() / 2. + 0.5;
+     blue = escape_velocity.sqrt().sin() / 2. + 0.5;
+     green = flames.re() / 2. + 0.5;
+
+
+    let red_byte = (red.max(0.).sqrt() * 256.) as u8;
+    let green_byte = (green.max(0.).sqrt() * 256.) as u8;
+    let blue_byte = (blue.max(0.).sqrt() * 256.) as u8;
+
+    [red_byte, green_byte, blue_byte, 255]
+}
 /// Converts Mandelbrot set properties into RGBA gamma 2 colour values
 ///
 /// # Arguments
@@ -663,14 +799,15 @@ fn calculate_mandelbrot_point(
 ///
 /// # Returns
 /// * `[u8; 4]` - RGBA colour values as bytes
-fn calculate_colour(
+fn _calculate_colour(
+    point: Complex64,
     is_inside: bool,
     period: u64,
     escape_velocity: f64,
     coordinates: Complex64,
     flames: Complex64,
     slope: Complex64,
-    rotation: Complex64,
+    zoom: Complex64,
 ) -> [u8; 4] {
     let mut red;
     let mut green;
@@ -680,81 +817,34 @@ fn calculate_colour(
         // Constants for 120° colour rotation
         let angle_120 = Complex64::new(-0.5, 0.75f64.sqrt());
         let angle_240 = Complex64::new(-0.5, -(0.75f64.sqrt()));
-
-        let slope_angle = slope / slope.norm();
-        let coord_magnitude_sq = coordinates.norm_sqr();
-        let coord_magnitude = coord_magnitude_sq.sqrt();
-        let coords_rotated = slope_angle * coord_magnitude * rotation;
-
-        // Calculate diffuse lighting
-        let mut diffuse = 1. - coord_magnitude_sq;
-        let temp = coords_rotated.im - coords_rotated.re + 2f64.sqrt();
-        diffuse = diffuse * temp * temp / 3.5;
-        diffuse = 1. - diffuse;
-        diffuse = diffuse * diffuse;
-        diffuse = 1. - diffuse * diffuse;
-
-        // Calculate base colour from polar coordinates
-        let (magnitude, angle) = coordinates.to_polar();
-        let interior_colour =
-            Complex64::from_polar(magnitude, angle + 3. / coord_magnitude.sqrt() + 3.);
+        let mut mag_sq = coordinates.norm_sqr();
+        mag_sq = mag_sq * mag_sq;
+        mag_sq = mag_sq * mag_sq;
 
         // Generate RGB components through 120° rotations
-        red = interior_colour.re + 1.;
-        green = (interior_colour * angle_120).re + 1.;
-        blue = (interior_colour * angle_240).re + 1.;
+        red = (coordinates.re + 1.) / 2.;
+        green = ((coordinates * angle_120).re + 1.) / 2.;
+        blue = ((coordinates * angle_240).re + 1.) / 2.;
 
-        // Apply quadratic intensity scaling
-        red = red * red / 4.;
-        green = green * green / 4.;
-        blue = blue * blue / 4.;
-
-        // Apply diffuse lighting with bounds checking
-        red = (red * diffuse).max(0.);
-        green = (green * diffuse).max(0.);
-        blue = (blue * diffuse).max(0.);
+        red = red * (1. - mag_sq);
+        green = green * (1. - mag_sq);
+        blue = blue * (1. - mag_sq);
     } else {
-        // Constants for exterior colouring
-        let angle_pos = Complex64::from_polar(1., 1.);
-        let angle_neg = Complex64::from_polar(1., -1.);
+        // Constants for 120° colour rotation
+        let angle_120 = Complex64::new(-0.5, 0.75f64.sqrt());
+        let angle_240 = Complex64::new(-0.5, -(0.75f64.sqrt()));
+        let scale = 1. / slope.norm();
 
-        // Calculate slope-based shading
-        let slope_magnitude = slope.norm();
-        let slope_direction =
-            slope * (1. / slope_magnitude) * rotation * Complex64::from_polar(1., -0.2);
-        let slope_intensity = slope_direction.im / 4. + 0.5;
-        let glow = ((-53. - slope_magnitude.log2()).max(0.)).sqrt();
+        let intensity = slope.norm().log2().sin() / 2. + 1.;
+        // Generate RGB components through 120° rotations
+        red = (slope.re * scale + 1.) / 8. * intensity;
+        green = ((slope * angle_120 * scale).re + 1.) / 8. * intensity;
+        blue = ((slope * angle_240 * scale).re + 1.) / 8. * intensity;
 
-        // Calculate flame colouring
-        let flame = flames / 3.;
-        let flame_red = flame.re;
-        let flame_green = (flame * angle_pos).re;
-        let flame_blue = (flame * angle_neg).re;
-
-        // Calculate escape velocity based colouring
-        let mut escape_log = escape_velocity.log2();
-        let escape_factor = 0.008 / (escape_log - 8.7);
-        escape_log = 3.2 - escape_log * 14.;
-
-        // Combine base colours
-        red = escape_factor * (escape_log.sin() + 2.5);
-        green = escape_factor * ((escape_log + 0.8).sin() + 2.5) * 0.9;
-        blue = escape_factor * ((escape_log + 2.).sin() + 2.5) * 0.7;
-
-        // Add flame effects
-        red += flame_red;
-        green += flame_green;
-        blue += flame_blue;
-
-        // Apply slope shading
-        red *= slope_intensity;
-        green *= slope_intensity;
-        blue *= slope_intensity;
-
-        // Add glow effects
-        blue += glow;
-        green += glow / 3.;
-        red += glow / 9.;
+        let flame_scale = 0.5 / flames.norm();
+        red = (flames.re * flame_scale + 1.) * red;
+        green = ((flames * angle_120 * flame_scale).re + 1.) * green;
+        blue = ((flames * angle_240 * flame_scale).re + 1.) * blue;
     }
 
     // Convert to 8-bit colour with gamma correction and bounds checking

@@ -8,8 +8,8 @@ A Mandelbrot set explorer written in Rust with real-time interaction and paralle
 - Progressive detail refinement
 - Parallel computation for calculations
 - Window-resize handling
-- High-precision (64-bit) floating point math
-- Escape-time visualization with orbit trap coloring
+- 64-bit precision
+- Escape-time visualization with orbit trap colouring
 
 ## Building
 
@@ -37,7 +37,7 @@ The visualization uses:
 Core components:
 - Escape-time calculation with period checking
 - Newton iteration for period calculation
-- Orbit tracking for color generation
+- Orbit tracking for colour generation
 - View transformation with coordinate remapping
 - Progressive refinement during navigation
 - Atomic counters for thread-safe progress tracking
@@ -45,8 +45,6 @@ Core components:
 ## License
 
 MIT License
-
-Copyright (c) 2024
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
