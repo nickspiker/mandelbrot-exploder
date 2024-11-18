@@ -1,18 +1,24 @@
 use num_complex::*;
 use pixels::{Error, Pixels, SurfaceTexture};
 use rand::prelude::*;
+use rand_distr::{Distribution, Normal};
 use rayon::prelude::*;
+use std::f64::NAN;
+use std::fs::File;
+use std::io::Write;
+use std::ops::Mul;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread;
+use std::time::{Duration, Instant};
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, Event, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::window::WindowBuilder;
 
 const MAX_ITERATIONS: u64 = 1 << 24;
-const INITIAL_WIDTH: usize = 0x400;
+const INITIAL_WIDTH: usize = 0x800;
 const INITIAL_HEIGHT: usize = 0x400;
 struct MandelbrotBuffer {
     pixel_buffer: Vec<u8>,
@@ -70,8 +76,6 @@ impl MandelbrotBuffer {
     }
 
     fn interpolate_pixels(&mut self) {
-        self.plot_boundary_path();
-        // Up-down pass second
         for x in 3..self.width - 3 {
             for y in 3..self.height - 3 {
                 let idx = y * self.width * 4 + x * 4;
@@ -297,9 +301,9 @@ impl MandelbrotBuffer {
     }
 
     fn apply_rotation(&mut self, cursor_pos: PhysicalPosition<f64>, rotation_delta: f64) {
-        let cursor_coordinates = Self::screen_to_complex(
-            self.width as f64 - cursor_pos.x,
-            self.height as f64 - cursor_pos.y,
+        let cursor_coordinates_old = Self::screen_to_complex(
+            cursor_pos.x,
+            cursor_pos.y,
             self.width as f64,
             self.height as f64,
             self.zoom,
@@ -308,18 +312,10 @@ impl MandelbrotBuffer {
 
         let rotation = Complex64::new(rotation_delta.cos(), rotation_delta.sin());
 
-        // First rotate the zoom factor
         self.zoom *= rotation;
+        self.center = cursor_coordinates_old + (self.center - cursor_coordinates_old) * rotation;
 
-        // Then rotate the center around the cursor
-        self.center = cursor_coordinates + (self.center - cursor_coordinates) * rotation;
-    }
-    fn set_center(&mut self, cursor_pos: PhysicalPosition<f64>) {
-        // Store old center for transform_buffer
-        self.old_center = self.center;
-
-        // Set new center based on cursor position
-        self.center = Self::screen_to_complex(
+        let cursor_coordinates_new = Self::screen_to_complex(
             cursor_pos.x,
             cursor_pos.y,
             self.width as f64,
@@ -327,6 +323,9 @@ impl MandelbrotBuffer {
             self.zoom,
             self.center,
         );
+
+        // Adjust center by how far cursor moved due to rotation
+        self.center += cursor_coordinates_old - cursor_coordinates_new;
     }
 
     fn start_z_iterations(&mut self) {
@@ -368,7 +367,7 @@ impl MandelbrotBuffer {
                 let point =
                     Self::screen_to_complex(x, y, width as f64, height as f64, zoom, center);
 
-                let (period, escape_velocity, coords, flames, slope) =
+                let (period, escape_velocity, coords, flames, slope, _multiplier) =
                     calculate_mandelbrot_point(point, MAX_ITERATIONS);
 
                 let colour =
@@ -412,17 +411,21 @@ impl MandelbrotBuffer {
         coords: Complex64,
         flames: Complex64,
         slope: Complex64,
+        multiplier: Complex64,
     ) -> String {
         if period == 0 {
             format!(
                 "Outside point: [{}, {}]\n\
+                 Scale: 2^{}\n\
                  Zoom: [{}, {}]\n\
                  Escape velocity: {}\n\
                  Coordinates: [{}, {}]\n\
                  Flame coords: [{}, {}]\n\
-                 Slope: [{}, {}]",
+                 Slope: [{}, {}]\n\
+                 Multiplier: [{}, {}]",
                 point.re,
                 point.im,
+                zoom.norm().log2(),
                 zoom.re,
                 zoom.im,
                 escape_velocity,
@@ -431,18 +434,23 @@ impl MandelbrotBuffer {
                 flames.re,
                 flames.im,
                 slope.re,
-                slope.im
+                slope.im,
+                multiplier.re,
+                multiplier.im
             )
         } else {
             format!(
                 "Inside point: [{}, {}]\n\
+                Scale: 2^{}\n\
                 Zoom: [{}, {}]\n\
                 Period: {}\n\
                 Coordinates: [{}, {}]\n\
                 Flame coords: [{}, {}]\n\
-                Slope: [{}, {}]",
+                Slope: [{}, {}]\n\
+                Multiplier: [{}, {}]",
                 point.re,
                 point.im,
+                zoom.norm().log2(),
                 zoom.re,
                 zoom.im,
                 period,
@@ -451,16 +459,21 @@ impl MandelbrotBuffer {
                 flames.re,
                 flames.im,
                 slope.re,
-                slope.im
+                slope.im,
+                multiplier.re,
+                multiplier.im
             )
         }
     }
     fn plot_boundary_path(&mut self) {
         let scale = ((self.width * self.width + self.height * self.height) as f64).sqrt();
-
-        for point in self.boundary_path.iter() {
+        let mut visible_points = Vec::new();
+        let mut prev_xi = std::isize::MIN;
+        let mut prev_yi = std::isize::MIN;
+        let mut skipped = false;
+        for idx in 0..self.boundary_path.len() {
             let (x, y) = Self::complex_to_screen(
-                *point,
+                self.boundary_path[idx],
                 self.width as f64,
                 self.height as f64,
                 self.zoom,
@@ -471,63 +484,304 @@ impl MandelbrotBuffer {
             let xi = x.floor() as isize;
             let yi = y.floor() as isize;
 
-            // Check if the point is within the buffer bounds
-            if xi >= 0 && xi < self.width as isize && yi >= 0 && yi < self.height as isize {
-                let idx = (yi as usize * self.width + xi as usize) * 4;
-                self.pixel_buffer[idx] = 255; // R
-                self.pixel_buffer[idx + 1] = 255; // G
-                self.pixel_buffer[idx + 2] = 255; // B
-                self.pixel_buffer[idx + 3] = 255; // A
+            if prev_xi != xi || prev_yi != yi {
+                if xi >= 0 && xi < self.width as isize && yi >= 0 && yi < self.height as isize {
+                    prev_xi = xi;
+                    prev_yi = yi;
+                    if skipped {
+                        skipped = false;
+                        visible_points.push(Complex::new(NAN, NAN));
+                    }
+                    visible_points.push(Complex::new(x, y));
+                } else {
+                    skipped = true;
+                }
+            }
+        }
+        if visible_points.len() > 1 {
+            for i in 0..visible_points.len() - 1 {
+                let x0 = visible_points[i].re;
+                let y0 = visible_points[i].im;
+                let x1 = visible_points[i + 1].re;
+                let y1 = visible_points[i + 1].im;
+                draw_line_u8(
+                    &mut self.pixel_buffer,
+                    self.width,
+                    x0 as f32,
+                    y0 as f32,
+                    x1 as f32,
+                    y1 as f32,
+                    [63, 63, 63],
+                );
             }
         }
     }
 }
+fn draw_line_u8(
+    image: &mut Vec<u8>,
+    image_width: usize,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    colour: [u8; 3],
+) {
+    let steep = (y1 - y0).abs() > (x1 - x0).abs();
+    let (mut x0, mut y0, mut x1, mut y1) = (x0, y0, x1, y1);
 
-fn random_unit_complex() -> Complex64 {
-    let mut rng = rand::thread_rng();
-    loop {
-        // Generate random point in [-1,1] × [-1,1]
-        let re = rng.gen_range(-1.0..=1.0);
-        let im = rng.gen_range(-1.0..=1.0);
-        let mag_sq = re * re + im * im;
+    if steep {
+        std::mem::swap(&mut x0, &mut y0);
+        std::mem::swap(&mut x1, &mut y1);
+    }
+    if x0 > x1 {
+        std::mem::swap(&mut x0, &mut x1);
+        std::mem::swap(&mut y0, &mut y1);
+    }
 
-        // If inside unit circle, normalize and return
-        if mag_sq <= 1.0 {
-            let mag = mag_sq.sqrt();
-            return Complex64::new(re / mag, im / mag); // Scale to radius 2 (outside Mandelbrot set)
+    let dx = x1 - x0;
+    let dy = y1 - y0;
+    let gradient = if dx == 0.0 { 1.0 } else { dy / dx };
+
+    let xend = (x0 + 0.5).floor();
+    let yend = y0 + gradient * (xend - x0);
+    let xgap = 1.0 - (x0 + 0.5).fract();
+    let xpxl1 = xend;
+    let ypxl1 = yend.floor();
+
+    let mut plot = |x: isize, y: isize, alias: f32| {
+        let channels = 4;
+        if x >= 0
+            && x < image_width as isize
+            && y >= 0
+            && y < (image.len() / (image_width * channels)) as isize
+        {
+            let idx = (y as usize) * image_width + (x as usize);
+            if image[idx * channels + 3] < 254 {
+                if image[idx * channels + 3] == 253 {
+                    image[idx * channels] =
+                        (image[idx * channels] as f32 * (1. - alias) + 256. * alias) as u8;
+                    image[idx * channels + 1] =
+                        (image[idx * channels + 1] as f32 * (1. - alias) + 256. * alias) as u8;
+                    image[idx * channels + 2] =
+                        (image[idx * channels + 2] as f32 * (1. - alias) + 256. * alias) as u8;
+                } else {
+                    image[idx * channels] = (alias * 256.) as u8;
+                    image[idx * channels + 1] = (alias * 256.) as u8;
+                    image[idx * channels + 2] = (alias * 256.) as u8;
+                    image[idx * channels + 3] = 253;
+                }
+            } else {
+                image[idx * channels] =
+                    image[idx * channels].wrapping_add((colour[0] as f32 * alias) as u8);
+                image[idx * channels + 1] =
+                    image[idx * channels + 1].wrapping_add((colour[1] as f32 * alias) as u8);
+                image[idx * channels + 2] =
+                    image[idx * channels + 2].wrapping_add((colour[2] as f32 * alias) as u8);
+            }
         }
-        // Otherwise try again
+    };
+
+    if steep {
+        plot(ypxl1 as isize, xpxl1 as isize, (1.0 - yend.fract()) * xgap);
+        plot((ypxl1 + 1.0) as isize, xpxl1 as isize, yend.fract() * xgap);
+    } else {
+        plot(xpxl1 as isize, ypxl1 as isize, (1.0 - yend.fract()) * xgap);
+        plot(xpxl1 as isize, (ypxl1 + 1.0) as isize, yend.fract() * xgap);
+    }
+
+    let mut intery = yend + gradient;
+
+    let xend = (x1 + 0.5).floor();
+    let yend = y1 + gradient * (xend - x1);
+    let xgap = (x1 + 0.5).fract();
+    let xpxl2 = xend;
+    let ypxl2 = yend.floor();
+
+    if steep {
+        plot(ypxl2 as isize, xpxl2 as isize, (1.0 - yend.fract()) * xgap);
+        plot((ypxl2 + 1.0) as isize, xpxl2 as isize, yend.fract() * xgap);
+    } else {
+        plot(xpxl2 as isize, ypxl2 as isize, (1.0 - yend.fract()) * xgap);
+        plot(xpxl2 as isize, (ypxl2 + 1.0) as isize, yend.fract() * xgap);
+    }
+
+    if steep {
+        for x in (xpxl1 as isize + 1)..(xpxl2 as isize) {
+            plot(intery.floor() as isize, x, 1.0 - intery.fract());
+            plot((intery.floor() + 1.0) as isize, x, intery.fract());
+            intery += gradient;
+        }
+    } else {
+        for x in (xpxl1 as isize + 1)..(xpxl2 as isize) {
+            plot(x, intery.floor() as isize, 1.0 - intery.fract());
+            plot(x, (intery.floor() + 1.0) as isize, intery.fract());
+            intery += gradient;
+        }
     }
 }
+fn compute_escape_path(src_point: Complex64) -> Vec<Complex64> {
+    let mut path_outward = Vec::new();
+    let mut point = src_point;
+    let mut prev_point = Complex64::new(0., 0.);
+    // Start with jitter below machine epsilon
+    let mut jitter = 1. / (1u64 << 63) as f64;
+    let mut rng = thread_rng();
 
-fn roll_to_boundary() -> (Vec<Complex64>, Complex64) {
-    let random = random_unit_complex();
-    let mut point = random * 65536.;
-    let mut path = vec![point];
-    let mut previous_point = point;
-    let mut dist = Complex64::new(0., 0.);
-
-    loop {
-        let (period, _escape_velocity, _coords, _flames, slope) =
+    while point.is_finite() {
+        let (_period, _escape_velocity, _coords, _flames, slope, _multiplier) =
             calculate_mandelbrot_point(point, MAX_ITERATIONS);
-        if period != 0 {
+
+        point = point + Complex64::new(slope.re, -slope.im) / 256.;
+
+        // If we hit the same point, we need to jitter
+        // This invalidates the current path as it creates a discontinuity
+        if point == prev_point {
+            let normal = Normal::new(0., jitter).unwrap();
+            point = point + Complex64::new(normal.sample(&mut rng), normal.sample(&mut rng));
+            jitter = jitter * 2.; // Increase jitter for next time if needed
+            path_outward = Vec::new(); // Reset path as we've had to jitter
+            continue;
+        }
+
+        // Only record points that are finite and before any jittering
+        if point.is_finite() {
+            path_outward.push(point);
+        }
+        prev_point = point;
+    }
+
+    let mut path_inward = Vec::new();
+    let mut point = src_point;
+    let mut prev_point = Complex64::new(0., 0.);
+
+    while point.is_finite() {
+        let (_period, _escape_velocity, _coords, _flames, slope, _multiplier) =
+            calculate_mandelbrot_point(point, MAX_ITERATIONS);
+
+        point = point - Complex64::new(slope.re, -slope.im) / 256.;
+
+        if point == prev_point {
             break;
         }
 
-        point = point + Complex::new(-(slope.re), slope.im) / 256.;
-        path.push(point);
-        if point == previous_point {
-            break;
+        if point.is_finite() {
+            path_inward.push(point);
         }
-        dist = point - previous_point;
-        previous_point = point;
+        prev_point = point;
     }
-    (path, dist * random)
+
+    path_inward.reverse();
+    path_outward.extend(path_inward);
+    path_outward
+}
+fn roll_to_boundary() -> (Vec<Complex64>, Complex64) {
+    let start_time = Instant::now();
+    let duration = Duration::from_secs(1);
+    let thread_count = rayon::current_num_threads();
+
+    // Each thread maintains its own best path
+    let thread_paths: Vec<_> = (0..thread_count)
+        .into_par_iter()
+        .map(|_| {
+            let mut rng = thread_rng();
+            let mut thread_best_path = Vec::new();
+
+            // Keep trying new paths until time runs out or we reach the min path length
+            while start_time.elapsed() < duration {
+                // Start with maximum search width and reset tracking variables
+                let mut gaussian_width = 256.;
+                let mut prev_slope = std::f64::MAX;
+                let mut point = Complex64::new(0., 0.);
+
+                // Phase 1: Find a point outside the set
+                // Reduce the search width each time we find a point with a smaller slope
+                while gaussian_width > 1. / (1u64 << 63) as f64 && start_time.elapsed() < duration {
+                    let normal = Normal::new(0., gaussian_width).unwrap();
+                    let new_point =
+                        Complex64::new(normal.sample(&mut rng), normal.sample(&mut rng)) + point;
+
+                    let (period, _escape_velocity, _coords, _flames, slope, _multiplier) =
+                        calculate_mandelbrot_point(new_point, MAX_ITERATIONS);
+
+                    if point == new_point {
+                        break;
+                    }
+                    // Period 0 means we're outside the set. Keep the point with the smallest slope
+                    if period == 0 {
+                        if slope.norm() < prev_slope {
+                            gaussian_width = slope.norm(); // Reduce search width
+                            prev_slope = slope.norm();
+                            point = new_point;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+
+                // Phase 2: Follow a path along the outside of the set using the gradient
+                let mut path = Vec::new();
+                let mut prev_point = Complex64::new(0., 0.);
+                // Start with jitter below machine epsilon
+                let mut jitter = 1. / (1u64 << 63) as f64;
+
+                while point.is_finite() && start_time.elapsed() < duration {
+                    let (_period, _escape_velocity, _coords, _flames, slope, _multiplier) =
+                        calculate_mandelbrot_point(point, MAX_ITERATIONS);
+
+                    point = point + Complex64::new(slope.re, -slope.im) / 256.;
+
+                    // If we hit the same point, we need to jitter
+                    // This invalidates the current path as it creates a discontinuity
+                    if point == prev_point {
+                        let normal = Normal::new(0., jitter).unwrap();
+                        point = point
+                            + Complex64::new(normal.sample(&mut rng), normal.sample(&mut rng));
+                        jitter = jitter * 2.; // Increase jitter for next time if needed
+                        path = Vec::new(); // Reset path as we've had to jitter
+                        continue;
+                    }
+
+                    // Only record points that are finite and before any jittering
+                    if point.is_finite() {
+                        path.push(point);
+                    }
+                    prev_point = point;
+                }
+
+                // Update thread's best path if this one is longer
+                if path.len() > thread_best_path.len() {
+                    thread_best_path = path;
+                }
+            }
+
+            thread_best_path
+        })
+        .collect();
+
+    // Find the longest path among all threads
+    let mut best_path = Vec::new();
+    for path in thread_paths {
+        if path.len() > best_path.len() {
+            best_path = path;
+        }
+    }
+
+    // println!("Path length: {}", (best_path.len() as f64).log2());
+    // let mut file = File::create("path.csv").unwrap();
+    // let file_string = best_path
+    //     .iter()
+    //     .map(|point| format!("{},{}\n", point.to_polar().0, point.to_polar().1))
+    //     .collect::<String>();
+    // file.write_all(file_string.as_bytes()).unwrap();
+
+    // Calculate direction from the end of the path
+    let mut sign = best_path[best_path.len() - 2] - best_path[best_path.len() - 3];
+    sign = sign.norm() / sign;
+    (best_path, sign * (1u64 << 56) as f64)
 }
 
 fn main() -> Result<(), Error> {
-    let (boundary_path, distance) = roll_to_boundary();
-
+    // Initialize window and graphics
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new()
         .with_title("Mandelbrot Exploder")
@@ -538,44 +792,86 @@ fn main() -> Result<(), Error> {
         .build(&event_loop)
         .unwrap();
 
+    // Set up pixels buffer for rendering
     let window_size = window.inner_size();
     let mut pixels = {
         let surface_texture = SurfaceTexture::new(window_size.width, window_size.height, &window);
         Pixels::new(window_size.width, window_size.height, surface_texture)?
     };
 
+    // Initialize the Mandelbrot buffer with initial dimensions and parameters
     let width = window_size.width as usize;
     let height = window_size.height as usize;
+    let (boundary_path, distance) = roll_to_boundary();
+
     let mut buffer = MandelbrotBuffer::new(
         width,
         height,
-        boundary_path[boundary_path.len() - 1],
-        1. / (distance * ((width * width + height * height) as f64).sqrt() * 256.),
+        boundary_path[1],
+        distance / ((width * width + height * height) as f64).sqrt(),
         boundary_path,
     );
     buffer.start_z_iterations();
+
+    // State tracking variables
     let mut cursor_pos = PhysicalPosition::new(0., 0.);
     let mut accumulated_zoom = 0.;
     let mut accumulated_rotation = 0.;
+    let mut drag_start_pos: Option<PhysicalPosition<f64>> = None;
+    let mut dragging = false;
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Poll;
 
         match event {
+            // Handle window close
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 ..
             } => {
+                buffer.stop_flag.store(true, Ordering::Relaxed);
                 *control_flow = ControlFlow::Exit;
             }
 
+            // Track cursor position and handle dragging
             Event::WindowEvent {
                 event: WindowEvent::CursorMoved { position, .. },
                 ..
             } => {
                 cursor_pos = position;
+
+                if let Some(start_pos) = drag_start_pos {
+                    dragging = true;
+                    // Get the start point in complex coordinates
+                    let start_point = MandelbrotBuffer::screen_to_complex(
+                        start_pos.x,
+                        start_pos.y,
+                        buffer.width as f64,
+                        buffer.height as f64,
+                        buffer.zoom,
+                        buffer.center,
+                    );
+
+                    // Get the current point in complex coordinates
+                    let current_point = MandelbrotBuffer::screen_to_complex(
+                        position.x,
+                        position.y,
+                        buffer.width as f64,
+                        buffer.height as f64,
+                        buffer.zoom,
+                        buffer.center,
+                    );
+
+                    // Move the center by the difference
+                    buffer.center += start_point - current_point;
+                    buffer.transform_requested = true;
+
+                    // Update start position for next movement
+                    drag_start_pos = Some(position);
+                }
             }
 
+            // Handle mouse wheel for zooming and rotation
             Event::WindowEvent {
                 event: WindowEvent::MouseWheel { delta, .. },
                 ..
@@ -585,52 +881,71 @@ fn main() -> Result<(), Error> {
                     MouseScrollDelta::PixelDelta(pos) => pos.y / 50.,
                 };
 
+                // Shift + scroll rotates, normal scroll zooms
                 if buffer.shift_held {
-                    accumulated_rotation += scroll_amount * -0.1;
+                    accumulated_rotation += scroll_amount * std::f64::consts::PI / 8.0;
                 } else {
                     accumulated_zoom += scroll_amount;
                 }
                 buffer.transform_requested = true;
             }
 
+            // Handle mouse clicks and dragging
             Event::WindowEvent {
                 event:
                     WindowEvent::MouseInput {
-                        state: ElementState::Pressed,
+                        state,
                         button: MouseButton::Left,
                         ..
                     },
                 ..
             } => {
-                let point = MandelbrotBuffer::screen_to_complex(
-                    cursor_pos.x,
-                    cursor_pos.y,
-                    buffer.width as f64,
-                    buffer.height as f64,
-                    buffer.zoom,
-                    buffer.center,
-                );
+                match state {
+                    ElementState::Pressed => {
+                        drag_start_pos = Some(cursor_pos);
+                        dragging = false; // Start false, will be set true on any movement
+                    }
+                    ElementState::Released => {
+                        if !dragging {
+                            // Only handle click behavior if we never dragged
+                            let point = MandelbrotBuffer::screen_to_complex(
+                                cursor_pos.x,
+                                cursor_pos.y,
+                                buffer.width as f64,
+                                buffer.height as f64,
+                                buffer.zoom,
+                                buffer.center,
+                            );
 
-                let (period, escape_velocity, coords, flames, slope) =
-                    calculate_mandelbrot_point(point, MAX_ITERATIONS);
+                            if buffer.shift_held {
+                                // Shift + click: print point statistics
+                                let (period, escape_velocity, coords, flames, slope, multiplier) =
+                                    calculate_mandelbrot_point(point, MAX_ITERATIONS);
 
-                println!(
-                    "\n{}",
-                    MandelbrotBuffer::format_point_statistics(
-                        point,
-                        buffer.zoom,
-                        period,
-                        escape_velocity,
-                        coords,
-                        flames,
-                        slope
-                    )
-                );
-                buffer.set_center(cursor_pos);
-
-                buffer.transform_requested = true;
+                                println!(
+                                    "\n{}",
+                                    MandelbrotBuffer::format_point_statistics(
+                                        point,
+                                        buffer.zoom,
+                                        period,
+                                        escape_velocity,
+                                        coords,
+                                        flames,
+                                        slope,
+                                        multiplier
+                                    )
+                                );
+                            } else {
+                                buffer.boundary_path = compute_escape_path(point);
+                            }
+                        }
+                        drag_start_pos = None;
+                        dragging = false;
+                    }
+                }
             }
 
+            // Track shift key state
             Event::WindowEvent {
                 event: WindowEvent::ModifiersChanged(modifiers),
                 ..
@@ -638,11 +953,12 @@ fn main() -> Result<(), Error> {
                 buffer.shift_held = modifiers.shift();
             }
 
+            // Handle window resizing
             Event::WindowEvent {
                 event: WindowEvent::Resized(new_size),
                 ..
             } => {
-                // First resize the pixels buffer/surface
+                // Update pixel buffer size
                 pixels
                     .resize_surface(new_size.width, new_size.height)
                     .expect("Failed to resize surface");
@@ -650,15 +966,16 @@ fn main() -> Result<(), Error> {
                     .resize_buffer(new_size.width, new_size.height)
                     .expect("Failed to resize buffer");
 
-                // Then update the buffer dimensions
+                // Update buffer dimensions
                 buffer.width = new_size.width as usize;
                 buffer.height = new_size.height as usize;
                 buffer.pixel_buffer = vec![0; buffer.width * buffer.height * 4];
-
                 buffer.transform_requested = true;
             }
 
+            // Main render loop
             Event::MainEventsCleared => {
+                // Apply accumulated transformations
                 if accumulated_zoom != 0. {
                     buffer.stop_calculation();
                     buffer.apply_zoom(cursor_pos, accumulated_zoom);
@@ -673,6 +990,7 @@ fn main() -> Result<(), Error> {
                     buffer.transform_requested = true;
                 }
 
+                // Handle any pending transformations
                 if buffer.transform_requested {
                     buffer.stop_calculation();
                     buffer.transform_buffer();
@@ -680,12 +998,15 @@ fn main() -> Result<(), Error> {
                     buffer.transform_requested = false;
                 }
 
+                // Update and render the display
                 {
                     let shared_colours = buffer.shared_colours.lock().unwrap();
                     buffer.pixel_buffer.copy_from_slice(&shared_colours);
                 }
                 buffer.interpolate_pixels();
+                buffer.plot_boundary_path();
 
+                // Update frame buffer
                 let frame = pixels.frame_mut();
                 frame.copy_from_slice(buffer.pixel_buffer.as_slice());
 
@@ -717,8 +1038,15 @@ fn main() -> Result<(), Error> {
 fn calculate_mandelbrot_point(
     point: Complex<f64>,
     max_iterations: u64,
-) -> (u64, f64, Complex<f64>, Complex<f64>, Complex<f64>) {
-    let mut is_inside = false;
+) -> (
+    u64,
+    f64,
+    Complex<f64>,
+    Complex<f64>,
+    Complex<f64>,
+    Complex<f64>,
+) {
+    let mut inside = false;
     let point_re = point.re;
     let point_im = point.im;
     let mut z_re = point_re;
@@ -736,9 +1064,11 @@ fn calculate_mandelbrot_point(
     let mut orbit_re = 1f64;
     let mut orbit_im = 0f64;
     let mut z_min = f64::MAX;
+    let mut multiplier_re = 1f64;
+    let mut multiplier_im = 0f64;
 
     const MAX_NEWTON_STEPS: isize = 32;
-    let epsilon_squared = 2f64.powi(-57); // Moved from const to let
+    let epsilon_squared = 2f64.powi(-57);
 
     let mut has_converged = false;
 
@@ -811,7 +1141,14 @@ fn calculate_mandelbrot_point(
                         let mut du_re = 1.;
                         let mut du_im = 0.;
 
+                        multiplier_re = 1.;
+                        multiplier_im = 0.;
+
                         for _ in 0..iter {
+                            let temp_re = multiplier_re;
+                            multiplier_re = 2. * (temp_re * u_re - multiplier_im * u_im);
+                            multiplier_im = 2. * (temp_re * u_im + multiplier_im * u_re);
+
                             let du_temp = 2. * (du_re * u_re - du_im * u_im);
                             du_im = 2. * (du_re * u_im + du_im * u_re);
                             du_re = du_temp;
@@ -839,7 +1176,7 @@ fn calculate_mandelbrot_point(
                                 coord_im = du_im;
                                 flame_re = w_re;
                                 flame_im = w_im;
-                                is_inside = true;
+                                inside = true;
                                 period = iter;
                                 has_converged = true;
                                 break 'main_iteration;
@@ -862,7 +1199,7 @@ fn calculate_mandelbrot_point(
     let coordinates;
     let flame_coords;
 
-    if is_inside {
+    if inside {
         coordinates = Complex::new(coord_re, coord_im);
         flame_coords = Complex::new(flame_re, flame_im);
 
@@ -901,16 +1238,23 @@ fn calculate_mandelbrot_point(
         }
     }
 
-    (period, escape_velocity, coordinates, flame_coords, slope)
+    (
+        period,
+        escape_velocity,
+        coordinates,
+        flame_coords,
+        slope,
+        Complex::new(multiplier_re, multiplier_im),
+    )
 }
 fn calculate_colour(
-    point: Complex<f64>,
+    _point: Complex<f64>,
     period: u64,
     escape_velocity: f64,
     coordinates: Complex<f64>,
     flames: Complex<f64>,
     slope: Complex<f64>,
-    zoom: Complex<f64>,
+    _zoom: Complex<f64>,
 ) -> [u8; 4] {
     let mut red: f64;
     let mut green: f64;
@@ -963,6 +1307,12 @@ fn calculate_colour(
         red *= taper;
         green *= taper;
         blue *= taper;
+
+        // let onetwenty = Complex::new(-0.5, 0.75.sqrt());
+        // let onetwentyn = Complex::new(-0.5, -(0.75.sqrt()));
+        // red = flames.re;
+        // green = (flames * onetwenty).re;
+        // blue = (flames * onetwentyn).re;
     } else {
         let coordinates_norm = coordinates.norm();
         let coordinates_sign = coordinates / coordinates_norm;

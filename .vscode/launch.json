@@ -1,0 +1,23 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug executable 'mandelbrot-exploder'",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=mandelbrot-exploder",
+                    "--package=mandelbrot-exploder"
+                ],
+                "filter": {
+                    "name": "mandelbrot-exploder",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}
