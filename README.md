@@ -2,8 +2,6 @@
 
 An interactive Mandelbrot explorer with audio, and a test rig for [spirix](https://github.com/nickspiker/spirix) number types.
 
-The view coordinates are held in spirix `CircleF7E3`, and zoom is clamped to ±2^120. The iteration itself can run in `f32`, `f64`, or any of the 25 spirix F×E combinations (F3–F7 × E3–E7). Pick one from the dropdowns under the viewport stats. Escape values and flame sums that overflow the E3 range are expected; seeing how each type handles that is part of the point.
-
 The GUI is built on [fluor](https://github.com/nickspiker/fluor).
 
 ## Building
