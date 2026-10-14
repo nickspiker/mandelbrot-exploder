@@ -10,9 +10,11 @@ use num_complex::{Complex, Complex64};
 
 type Complex32 = Complex<f32>;
 
-/// Newton convergence threshold — the grid's `TWO.pow(-frac_bits/2)` (√machine-epsilon) for
-/// f32's 24-bit significand: 2⁻¹².
-const EPSILON_SQUARED: f32 = 2.441_406_25e-4; // 2^-12
+/// Newton convergence threshold on |step|²: machine epsilon for f32's 24-bit significand, so
+/// the step itself converges to √ε = 2⁻¹² — the same rule as the f64 pipeline's 2⁻⁵³.
+/// (It used to be 2⁻¹² on the *square*, accepting steps of 2⁻⁶, which left the multiplier
+/// unconverged and tore the bulb interiors.)
+const EPSILON_SQUARED: f32 = 5.960_464_5e-8; // 2^-24
 /// Tiny asymmetric nudge for interior root refinement — analogue of the grid's `TWO.pow(-2×frac_bits)`.
 const EPS_ROOT: f32 = 3.552_713_7e-15; // 2^-48
 
@@ -60,6 +62,8 @@ pub fn calculate_mandelbrot_point_f32(c: Complex64, frac_iter: f64, _log: bool) 
                 if !z_next_mag_sq.is_normal() {
                     break;
                 }
+                let z_prev = z;
+                // The derivative recurrence uses the orbit point that produced z_next.
                 z = z_next;
                 z_mag_sq = z.norm_sqr();
                 iter_mut += 1;
@@ -79,8 +83,8 @@ pub fn calculate_mandelbrot_point_f32(c: Complex64, frac_iter: f64, _log: bool) 
                 coord_acc += z * z_weight;
 
                 orbit = Complex32::new(
-                    (z.re * orbit.re - z.im * orbit.im) * 2. + 1.,
-                    (orbit.re * z.im + orbit.im * z.re) * 2.,
+                    (z_prev.re * orbit.re - z_prev.im * orbit.im) * 2. + 1.,
+                    (orbit.re * z_prev.im + orbit.im * z_prev.re) * 2.,
                 );
                 slope = Complex32::new(
                     (slope.re * z.re - slope.im * z.im) * 2. + 1.,
@@ -102,12 +106,15 @@ pub fn calculate_mandelbrot_point_f32(c: Complex64, frac_iter: f64, _log: bool) 
             let mut energy_sum_weighted64 = energy_sum_weighted as f64;
             let mut iter_mut = iter_mut;
 
-            let max_lb = f64::MAX.log2(); // 1024
+            // Horizon in lb lb space (10), so the fade reaches 0 where the ride ends.
+            let max_lb = f64::MAX.log2().log2();
             loop {
                 let z_next = z64 * z64 + point64;
                 if !z_next.norm_sqr().is_normal() {
                     break;
                 }
+                let z_prev = z64;
+                // The derivative recurrence uses the orbit point that produced z_next.
                 z64 = z_next;
                 let z_mag_sq64 = z64.norm_sqr();
                 iter_mut += 1;
@@ -129,22 +136,27 @@ pub fn calculate_mandelbrot_point_f32(c: Complex64, frac_iter: f64, _log: bool) 
                 dist_sum64 += z_weight;
                 coord64 += z64 * z_weight;
 
-                let orbit_temp = z64.re * orbit64.re - z64.im * orbit64.im;
-                let orbit_im = orbit64.re * z64.im + orbit64.im * z64.re;
+                let orbit_temp = z_prev.re * orbit64.re - z_prev.im * orbit64.im;
+                let orbit_im = orbit64.re * z_prev.im + orbit64.im * z_prev.re;
                 orbit64 = Complex64::new(orbit_temp * 2. + 1., orbit_im * 2.);
             }
 
             let z_mag_sq64 = z64.norm_sqr();
             escape_velocity = iter_mut as f64 + 1.0 - z_mag_sq64.log2().log2();
 
-            // Normalize and convert back to f32 — mirrors the spirix cells' "convert back to
-            // the working type" step, so the post-loop `has_converged` tail (slope
-            // normalization against √MAX) applies identically. Returning early here with the
-            // raw f64 orbit left slope at ±inf and blacked out every escaping pixel.
+            // Normalize here (the f64 sums may not fit the working type) and convert back to
+            // f32 — mirrors the spirix cells' "convert back to the working type" step, so the
+            // post-loop `has_converged` tail (slope normalization against √MAX) applies
+            // identically. The weights are reset to one so the tail's own normalization is a
+            // no-op: dividing by the pre-escalation weights a second time shrank every escaped
+            // coordinate and flame to nothing and painted the exterior grey.
             let c32 = |v: Complex64| Complex32::new(v.re as f32, v.im as f32);
             coord_acc = c32(coord64 / dist_sum64);
             flame_uniform = c32(flame_uniform64 / energy_sum_uniform64);
             flame_weighted = c32(flame_weighted64 / energy_sum_weighted64);
+            dist_sum = 1.0;
+            energy_sum_uniform = 1.0;
+            energy_sum_weighted = 1.0;
             slope_result = c32(orbit64); // placeholder — recomputed in the has_converged tail
 
             has_converged = true;

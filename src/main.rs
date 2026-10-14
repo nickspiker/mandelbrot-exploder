@@ -12,8 +12,19 @@ use num_complex::Complex64;
 fn main() {
     // Default starting position for manual tracing
     let boundary_path = Vec::new();
-    let center = Complex64::new(0.0, 0.0);
-    let zoom = Complex64::new(1.0, 0.0);
+    let mut center = Complex64::new(0.0, 0.0);
+    let mut zoom = Complex64::new(1.0, 0.0);
+    // MANDEL_VIEW=re,im,log2zoom starts at a given view (centre through f64, so good to
+    // about 2^-50): handy for scripted screenshots of the precision modes.
+    if let Ok(spec) = std::env::var("MANDEL_VIEW") {
+        let parts: Vec<f64> = spec.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+        if parts.len() == 3 {
+            center = Complex64::new(parts[0], parts[1]);
+            zoom = Complex64::new(2f64.powf(parts[2]), 0.0);
+        } else {
+            eprintln!("MANDEL_VIEW: expected re,im,log2zoom, got '{}'", spec);
+        }
+    }
 
     println!("Controls:");
     println!("  Mouse wheel: Zoom in/out");

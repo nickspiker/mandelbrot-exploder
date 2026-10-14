@@ -8,10 +8,14 @@
 //!
 //! Each instantiation is the same algorithm as the old `calculate_mandelbrot_point_f7e5`,
 //! parameterized on the working Circle/Scalar type plus the two width-dependent epsilons:
-//! `eps_newton` = −(fraction_bits / 2) (√machine-epsilon for Newton convergence) and
-//! `eps_root` = −(2 × fraction_bits) (the tiny asymmetric nudge in interior root refinement).
+//! `eps_newton` = −fraction_bits (the threshold on the *squared* Newton step, so the step
+//! converges to √machine-epsilon — the f64 pipeline's 2⁻⁵³ rule) and `eps_root` =
+//! −(2 × fraction_bits) (the tiny asymmetric nudge in interior root refinement). The E3 cells
+//! clamp them: the squared step vanishes below 2⁻¹²⁷ in an 8-bit exponent, and quadratic
+//! convergence jumps from ≈2⁻⁸⁰ to nothing, so their threshold stays at 2⁻⁶⁴ (step 2⁻³²);
+//! the nudge is clamped at 2⁻¹²⁰, the smallest the type can hold with margin.
 //! The overflow-escalation target stays fixed at F5E7 for every combo — it's the range escape
-//! hatch (i64 exponent), deliberately independent of the type under test so small-E runs
+//! hatch (i128 exponent), deliberately independent of the type under test so small-E runs
 //! visibly escalate.
 
 use super::mandelbrot_f64::MandelbrotResult;
@@ -87,6 +91,8 @@ macro_rules! spirix_mandelbrot {
                             break;
                         }
 
+                        let z_prev = z;
+                        // The derivative recurrence uses the orbit point that produced z_next.
                         z = z_next;
                         z_re_sq = z.r() * z.r();
                         z_im_sq = z.i() * z.i();
@@ -115,8 +121,8 @@ macro_rules! spirix_mandelbrot {
 
                         // Update derivatives
                         let orbit_temp =
-                            ((z.r() * orbit.r() - z.i() * orbit.i()) << 1u8) + <$S>::ONE;
-                        let orbit_im = (orbit.r() * z.i() + orbit.i() * z.r()) << 1u8;
+                            ((z_prev.r() * orbit.r() - z_prev.i() * orbit.i()) << 1u8) + <$S>::ONE;
+                        let orbit_im = (orbit.r() * z_prev.i() + orbit.i() * z_prev.r()) << 1u8;
                         orbit = <$C>::from((orbit_temp, orbit_im));
 
                         let slope_temp = (slope.r() * z.r() - slope.i() * z.i()) << 1u8;
@@ -156,10 +162,12 @@ macro_rules! spirix_mandelbrot {
                     loop {
                         let z_next = z_f5e7.square() + point_f5e7;
 
-                        if !z_next.is_normal() {
+                        if !z_next.magnitude_squared().is_normal() {
                             break;
                         }
 
+                        let z_prev_f5e7 = z_f5e7;
+                        // The derivative recurrence uses the orbit point that produced z_next.
                         z_f5e7 = z_next;
                         // |z|² of a normal z can still explode; saturate so lb().lb() stays defined.
                         let z_mag_sq_f5e7 = {
@@ -169,9 +177,12 @@ macro_rules! spirix_mandelbrot {
                         iter_mut += 1;
                         let iter_sq_f5e7 = ScalarF5E7::from(iter_mut * iter_mut);
 
+                        // Fade from 1 at escape to 0 at the type's horizon, both measured as
+                        // lb lb |z|² (the horizon is lb lb MAX = 127; against lb MAX ≈ 2¹²⁷ it
+                        // never left 1.0 and the whole ride weighed in untapered).
                         let log_log_mag_f5e7 = z_mag_sq_f5e7.lb().lb();
-                        let fade_f5e7 = (ScalarF5E7::MAX.lb() - log_log_mag_f5e7)
-                            / (ScalarF5E7::MAX.lb() - ScalarF5E7::ONE);
+                        let fade_f5e7 = (ScalarF5E7::MAX.lb().lb() - log_log_mag_f5e7)
+                            / (ScalarF5E7::MAX.lb().lb() - ScalarF5E7::ONE);
 
                         let taper_uniform_f5e7 = fade_f5e7;
                         let z_scale_uniform_f5e7 = taper_uniform_f5e7 / z_mag_sq_f5e7.sqrt();
@@ -189,9 +200,9 @@ macro_rules! spirix_mandelbrot {
                         dist_sum_f5e7 = dist_sum_f5e7 + z_weight_f5e7;
                         coord_f5e7 = coord_f5e7 + z_f5e7 * z_weight_f5e7;
 
-                        let orbit_temp = z_f5e7.r() * orbit_f5e7.r() - z_f5e7.i() * orbit_f5e7.i();
+                        let orbit_temp = z_prev_f5e7.r() * orbit_f5e7.r() - z_prev_f5e7.i() * orbit_f5e7.i();
                         let orbit_im_val =
-                            orbit_f5e7.r() * z_f5e7.i() + orbit_f5e7.i() * z_f5e7.r();
+                            orbit_f5e7.r() * z_prev_f5e7.i() + orbit_f5e7.i() * z_prev_f5e7.r();
                         orbit_f5e7 = CircleF5E7::from((
                             orbit_temp + orbit_temp + ScalarF5E7::ONE,
                             orbit_im_val + orbit_im_val,
@@ -225,6 +236,12 @@ macro_rules! spirix_mandelbrot {
                         <$S>::from(orbit_f5e7.r()),
                         <$S>::from(orbit_f5e7.i()),
                     ));
+                    // Already normalized above (in F5E7, where the sums fit); neutralize the
+                    // tail's normalization so the escaped coordinates are not divided by the
+                    // pre-escalation weights a second time.
+                    dist_sum = <$S>::ONE;
+                    energy_sum_uniform = <$S>::ONE;
+                    energy_sum_weighted = <$S>::ONE;
 
                     has_converged = true;
                     break 'main_iteration;
@@ -333,7 +350,7 @@ macro_rules! spirix_mandelbrot {
                     let mut d = <$C>::ONE;
 
                     for _ in 1..period {
-                        d = ((d * z) << 1u8) + <$C>::ONE;
+                        { let dz = d * z; d = dz + dz + <$C>::ONE; } // doubled by addition: `Circle << 1` overflows for some operands
                         z = z * z + refined_point;
                     }
 
@@ -397,32 +414,33 @@ macro_rules! spirix_mandelbrot {
     };
 }
 
-// The 25-cell grid. eps_newton = −(fraction_bits / 2); eps_root = −(2 × fraction_bits).
-spirix_mandelbrot!(calc_f3e3, CircleF3E3, ScalarF3E3, -4, -16);
-spirix_mandelbrot!(calc_f3e4, CircleF3E4, ScalarF3E4, -4, -16);
-spirix_mandelbrot!(calc_f3e5, CircleF3E5, ScalarF3E5, -4, -16);
-spirix_mandelbrot!(calc_f3e6, CircleF3E6, ScalarF3E6, -4, -16);
-spirix_mandelbrot!(calc_f3e7, CircleF3E7, ScalarF3E7, -4, -16);
-spirix_mandelbrot!(calc_f4e3, CircleF4E3, ScalarF4E3, -8, -32);
-spirix_mandelbrot!(calc_f4e4, CircleF4E4, ScalarF4E4, -8, -32);
-spirix_mandelbrot!(calc_f4e5, CircleF4E5, ScalarF4E5, -8, -32);
-spirix_mandelbrot!(calc_f4e6, CircleF4E6, ScalarF4E6, -8, -32);
-spirix_mandelbrot!(calc_f4e7, CircleF4E7, ScalarF4E7, -8, -32);
-spirix_mandelbrot!(calc_f5e3, CircleF5E3, ScalarF5E3, -16, -64);
-spirix_mandelbrot!(calc_f5e4, CircleF5E4, ScalarF5E4, -16, -64);
-spirix_mandelbrot!(calc_f5e5, CircleF5E5, ScalarF5E5, -16, -64);
-spirix_mandelbrot!(calc_f5e6, CircleF5E6, ScalarF5E6, -16, -64);
-spirix_mandelbrot!(calc_f5e7, CircleF5E7, ScalarF5E7, -16, -64);
-spirix_mandelbrot!(calc_f6e3, CircleF6E3, ScalarF6E3, -32, -128);
-spirix_mandelbrot!(calc_f6e4, CircleF6E4, ScalarF6E4, -32, -128);
-spirix_mandelbrot!(calc_f6e5, CircleF6E5, ScalarF6E5, -32, -128);
-spirix_mandelbrot!(calc_f6e6, CircleF6E6, ScalarF6E6, -32, -128);
-spirix_mandelbrot!(calc_f6e7, CircleF6E7, ScalarF6E7, -32, -128);
-spirix_mandelbrot!(calc_f7e3, CircleF7E3, ScalarF7E3, -64, -256);
-spirix_mandelbrot!(calc_f7e4, CircleF7E4, ScalarF7E4, -64, -256);
-spirix_mandelbrot!(calc_f7e5, CircleF7E5, ScalarF7E5, -64, -256);
-spirix_mandelbrot!(calc_f7e6, CircleF7E6, ScalarF7E6, -64, -256);
-spirix_mandelbrot!(calc_f7e7, CircleF7E7, ScalarF7E7, -64, -256);
+// The 25-cell grid. eps_newton = −fraction_bits (E3: at most −64); eps_root = −(2 × fraction_bits)
+// (E3: at most −120).
+spirix_mandelbrot!(calc_f3e3, CircleF3E3, ScalarF3E3, -8, -16);
+spirix_mandelbrot!(calc_f3e4, CircleF3E4, ScalarF3E4, -8, -16);
+spirix_mandelbrot!(calc_f3e5, CircleF3E5, ScalarF3E5, -8, -16);
+spirix_mandelbrot!(calc_f3e6, CircleF3E6, ScalarF3E6, -8, -16);
+spirix_mandelbrot!(calc_f3e7, CircleF3E7, ScalarF3E7, -8, -16);
+spirix_mandelbrot!(calc_f4e3, CircleF4E3, ScalarF4E3, -16, -32);
+spirix_mandelbrot!(calc_f4e4, CircleF4E4, ScalarF4E4, -16, -32);
+spirix_mandelbrot!(calc_f4e5, CircleF4E5, ScalarF4E5, -16, -32);
+spirix_mandelbrot!(calc_f4e6, CircleF4E6, ScalarF4E6, -16, -32);
+spirix_mandelbrot!(calc_f4e7, CircleF4E7, ScalarF4E7, -16, -32);
+spirix_mandelbrot!(calc_f5e3, CircleF5E3, ScalarF5E3, -32, -64);
+spirix_mandelbrot!(calc_f5e4, CircleF5E4, ScalarF5E4, -32, -64);
+spirix_mandelbrot!(calc_f5e5, CircleF5E5, ScalarF5E5, -32, -64);
+spirix_mandelbrot!(calc_f5e6, CircleF5E6, ScalarF5E6, -32, -64);
+spirix_mandelbrot!(calc_f5e7, CircleF5E7, ScalarF5E7, -32, -64);
+spirix_mandelbrot!(calc_f6e3, CircleF6E3, ScalarF6E3, -64, -120);
+spirix_mandelbrot!(calc_f6e4, CircleF6E4, ScalarF6E4, -64, -128);
+spirix_mandelbrot!(calc_f6e5, CircleF6E5, ScalarF6E5, -64, -128);
+spirix_mandelbrot!(calc_f6e6, CircleF6E6, ScalarF6E6, -64, -128);
+spirix_mandelbrot!(calc_f6e7, CircleF6E7, ScalarF6E7, -64, -128);
+spirix_mandelbrot!(calc_f7e3, CircleF7E3, ScalarF7E3, -64, -120);
+spirix_mandelbrot!(calc_f7e4, CircleF7E4, ScalarF7E4, -128, -256);
+spirix_mandelbrot!(calc_f7e5, CircleF7E5, ScalarF7E5, -128, -256);
+spirix_mandelbrot!(calc_f7e6, CircleF7E6, ScalarF7E6, -128, -256);
+spirix_mandelbrot!(calc_f7e7, CircleF7E7, ScalarF7E7, -128, -256);
 
 /// Grid dispatch: (fraction, exponent) in 3..=7 each → the matching instantiation.
 pub fn spirix_point_fn(f: u8, e: u8) -> SpirixPointFn {

@@ -5,10 +5,16 @@ edition = "2021"
 
 [dependencies]
 fluor = { path = "../fluor", features = ["host-winit"] }
-num-complex = "0.4"
+num-complex = { version = "0.4", features = ["bytemuck"] }
 rand = "0.8.5"
 rayon = "1.10.0"
 rand_distr = "0.4.3"
 rustfft = "6.2.0"
 spirix = { path = "../spirix" }
 rodio = "0.19"
+bytemuck = { version = "1", features = ["derive"] }
+
+# GPU path for the perturbation loop: wgpu/Metal compute, same wgpu as fluor's present path.
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { version = "28", default-features = false, features = ["metal", "wgsl"] }
+pollster = "0.4"

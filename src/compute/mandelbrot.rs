@@ -249,8 +249,8 @@ pub fn calculate_mandelbrot_point_f7e5(
     let mut slope_result = CircleF7E5::ZERO;
 
     const MAX_NEWTON_STEPS: isize = 32;
-    // sqrt(machine epsilon) for optimal Newton convergence with 128-bit fraction
-    let epsilon_squared = ScalarF7E5::TWO.pow(-64);
+    // Machine epsilon on the squared Newton step, so the step converges to √ε = 2⁻⁶⁴.
+    let epsilon_squared = ScalarF7E5::TWO.pow(-128);
 
     let mut has_converged = false;
 
@@ -286,6 +286,8 @@ pub fn calculate_mandelbrot_point_f7e5(
                 }
 
                 // Next z is good - commit update and accumulate
+                let z_prev = z;
+                // The derivative recurrence uses the orbit point that produced z_next.
                 z = z_next;
                 z_re_sq = z.r() * z.r();
                 z_im_sq = z.i() * z.i();
@@ -314,8 +316,8 @@ pub fn calculate_mandelbrot_point_f7e5(
                 coord = coord + CircleF7E5::from((z.r() * z_weight, z.i() * z_weight));
 
                 // Update derivatives
-                let orbit_temp = ((z.r() * orbit.r() - z.i() * orbit.i()) << 1u8) + ScalarF7E5::ONE;
-                let orbit_im = (orbit.r() * z.i() + orbit.i() * z.r()) << 1u8;
+                let orbit_temp = ((z_prev.r() * orbit.r() - z_prev.i() * orbit.i()) << 1u8) + ScalarF7E5::ONE;
+                let orbit_im = (orbit.r() * z_prev.i() + orbit.i() * z_prev.r()) << 1u8;
                 orbit = CircleF7E5::from((orbit_temp, orbit_im));
 
                 let slope_temp = (slope.r() * z.r() - slope.i() * z.i()) << 1u8;
@@ -351,10 +353,12 @@ pub fn calculate_mandelbrot_point_f7e5(
             loop {
                 let z_next = z_f5e7.square() + point_f5e7;
 
-                if !z_next.is_normal() {
+                if !z_next.magnitude_squared().is_normal() {
                     break;
                 }
 
+                let z_prev_f5e7 = z_f5e7;
+                // The derivative recurrence uses the orbit point that produced z_next.
                 z_f5e7 = z_next;
                 // |z|² of a normal z can still explode; saturate so lb().lb() stays defined.
                 let z_mag_sq_f5e7 = {
@@ -365,8 +369,8 @@ pub fn calculate_mandelbrot_point_f7e5(
                 let iter_sq_f5e7 = ScalarF5E7::from(iter_mut * iter_mut);
 
                 let log_log_mag_f5e7 = z_mag_sq_f5e7.lb().lb();
-                let fade_f5e7 = (ScalarF5E7::MAX.lb() - log_log_mag_f5e7)
-                    / (ScalarF5E7::MAX.lb() - ScalarF5E7::ONE);
+                let fade_f5e7 = (ScalarF5E7::MAX.lb().lb() - log_log_mag_f5e7)
+                    / (ScalarF5E7::MAX.lb().lb() - ScalarF5E7::ONE);
 
                 // Variant 1: Uniform weighting (fade-only)
                 let taper_uniform_f5e7 = fade_f5e7;
@@ -384,8 +388,8 @@ pub fn calculate_mandelbrot_point_f7e5(
                 dist_sum_f5e7 = dist_sum_f5e7 + z_weight_f5e7;
                 coord_f5e7 = coord_f5e7 + z_f5e7 * z_weight_f5e7;
 
-                let orbit_temp = z_f5e7.r() * orbit_f5e7.r() - z_f5e7.i() * orbit_f5e7.i();
-                let orbit_im_val = orbit_f5e7.r() * z_f5e7.i() + orbit_f5e7.i() * z_f5e7.r();
+                let orbit_temp = z_prev_f5e7.r() * orbit_f5e7.r() - z_prev_f5e7.i() * orbit_f5e7.i();
+                let orbit_im_val = orbit_f5e7.r() * z_prev_f5e7.i() + orbit_f5e7.i() * z_prev_f5e7.r();
                 orbit_f5e7 = CircleF5E7::from((
                     orbit_temp + orbit_temp + ScalarF5E7::ONE,
                     orbit_im_val + orbit_im_val,
@@ -418,6 +422,10 @@ pub fn calculate_mandelbrot_point_f7e5(
                 ScalarF7E5::from(orbit_f5e7.r()),
                 ScalarF7E5::from(orbit_f5e7.i()),
             ));
+            // Already normalized; keep the tail from dividing by the pre-escalation weights again.
+            dist_sum = ScalarF7E5::ONE;
+            energy_sum_uniform = ScalarF7E5::ONE;
+            energy_sum_weighted = ScalarF7E5::ONE;
 
             has_converged = true;
             break 'main_iteration;
@@ -525,7 +533,7 @@ pub fn calculate_mandelbrot_point_f7e5(
             let mut d = CircleF7E5::ONE;
 
             for _ in 1..period {
-                d = ((d * z) << 1u8) + CircleF7E5::ONE;
+                { let dz = d * z; d = dz + dz + CircleF7E5::ONE; } // doubled by addition: `Circle << 1` overflows for some operands
                 z = z * z + refined_point;
             }
 

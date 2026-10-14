@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicU8, Ordering};
+
 use num_complex::{Complex, ComplexFloat};
 
 use crate::compute::mandelbrot_f64::MandelbrotResult;
@@ -17,11 +19,156 @@ use crate::compute::mandelbrot_f64::MandelbrotResult;
 /// - Red: flame (linear taper-weighted)
 /// - Green: iteration count (escape_velocity)
 /// - Blue: flame_iter (iteration-weighted)
+
+/// Selected theme (index into `THEME_NAMES`), read per pixel by every calculation thread.
+pub static THEME: AtomicU8 = AtomicU8::new(0);
+pub const THEME_NAMES: &[&str] = &["classic", "bands", "log bands", "distance", "flame"];
+
+pub fn set_theme(index: usize) {
+    THEME.store((index % THEME_NAMES.len()) as u8, Ordering::Relaxed);
+}
+
+pub fn theme() -> usize {
+    THEME.load(Ordering::Relaxed) as usize % THEME_NAMES.len()
+}
+
+/// Parse `MANDEL_THEME` (a name from `THEME_NAMES` or an index).
+pub fn theme_from_spec(spec: &str) -> Option<usize> {
+    let spec = spec.trim().to_lowercase();
+    if let Ok(i) = spec.parse::<usize>() {
+        return (i < THEME_NAMES.len()).then_some(i);
+    }
+    THEME_NAMES.iter().position(|n| *n == spec)
+}
+
+/// RGBA colour for a pixel under the selected theme. `zoom` sets the pixel scale the
+/// magnification-invariant themes normalise by.
 pub fn calculate_colour(
     point: Complex<f64>,
     result: &MandelbrotResult,
     zoom: Complex<f64>,
 ) -> [u8; 4] {
+    match theme() {
+        1 => bands(point, result, zoom, false),
+        2 => bands(point, result, zoom, true),
+        3 => distance(result, zoom),
+        4 => flame(point, result, zoom),
+        _ => bytes_sqrt(classic_rgb(point, result, zoom)),
+    }
+}
+
+/// The classic output stage: sqrt as a gamma, scaled to bytes.
+fn bytes_sqrt(rgb: [f64; 3]) -> [u8; 4] {
+    let b = |v: f64| ((v as f32).sqrt() * 256.) as u8;
+    [b(rgb[0]), b(rgb[1]), b(rgb[2]), 255]
+}
+
+fn bytes(rgb: [f64; 3]) -> [u8; 4] {
+    let b = |v: f64| if v.is_finite() { (v.clamp(0., 1.) * 255.999) as u8 } else { 0 };
+    [b(rgb[0]), b(rgb[1]), b(rgb[2]), 255]
+}
+
+/// Smooth cyclic palette (one full cycle per unit of `t`).
+fn cyclic(t: f64) -> [f64; 3] {
+    let f = |phase: f64| 0.5 + 0.5 * (std::f64::consts::TAU * (t + phase)).cos();
+    [f(0.0), f(1.0 / 3.0), f(2.0 / 3.0)]
+}
+
+fn hsv(h: f64, s: f64, v: f64) -> [f64; 3] {
+    let h = (h.rem_euclid(1.0)) * 6.0;
+    let i = h.floor();
+    let f = h - i;
+    let p = v * (1.0 - s);
+    let q = v * (1.0 - s * f);
+    let t = v * (1.0 - s * (1.0 - f));
+    match i as i32 {
+        0 => [v, t, p],
+        1 => [q, v, p],
+        2 => [p, v, t],
+        3 => [p, q, v],
+        4 => [t, p, v],
+        _ => [v, p, q],
+    }
+}
+
+/// Distance estimate in pixels: slope = ln|z|²·z̄/ō at the escape, so DE = |slope| / 2; a
+/// pixel is about |zoom| / 1000 in the plane. Zero when undefined.
+fn de_pixels(result: &MandelbrotResult, zoom: Complex<f64>) -> f64 {
+    let de = 0.5 * result.slope.norm();
+    let px = zoom.norm() * 1e-3;
+    if de.is_finite() && px > 0.0 && px.is_finite() {
+        de / px
+    } else {
+        0.0
+    }
+}
+
+fn escape_count(result: &MandelbrotResult) -> f64 {
+    let ev = result.escape_velocity;
+    if ev.is_finite() && ev > 1.0 {
+        ev
+    } else {
+        1.0
+    }
+}
+
+/// Iteration bands through a cyclic palette, linear in the count (one cycle per 24
+/// iterations) or in its logarithm (two cycles per e-fold, which keeps the band width
+/// constant across magnifications), darkened toward the boundary by the distance estimate.
+fn bands(point: Complex<f64>, result: &MandelbrotResult, zoom: Complex<f64>, log: bool) -> [u8; 4] {
+    if result.period != 0 {
+        return bytes_sqrt(classic_rgb(point, result, zoom));
+    }
+    let ev = escape_count(result);
+    let t = if log { ev.ln() * 2.0 } else { ev / 24.0 };
+    let base = cyclic(t);
+    let edge = 1.0 - 0.7 * (-de_pixels(result, zoom) / 1.5).exp();
+    bytes([base[0] * edge, base[1] * edge, base[2] * edge])
+}
+
+/// Magnification-invariant: the exterior is shaded by the distance estimate in pixels (dark
+/// at the boundary, hue cycling with its logarithm), the interior by the pixel's offset from
+/// its component's nucleus, which is a delta-scale quantity and so resolves at any depth.
+fn distance(result: &MandelbrotResult, zoom: Complex<f64>) -> [u8; 4] {
+    let px = zoom.norm() * 1e-3;
+    if result.period != 0 {
+        let diff = result.slope.conj();
+        if !diff.re.is_finite() || !diff.im.is_finite() || px <= 0.0 {
+            return bytes([0.3, 0.3, 0.3]);
+        }
+        let r = (diff.norm() / px).max(1e-9);
+        let hue = diff.arg() / std::f64::consts::TAU;
+        let ring = 0.5 + 0.5 * (std::f64::consts::TAU * r.log2()).cos();
+        return bytes(hsv(hue, 0.55, 0.4 + 0.45 * ring));
+    }
+    let d = de_pixels(result, zoom).max(1e-6);
+    let hue = d.log2() / 10.0;
+    let v = 1.0 - (-d / 4.0).exp();
+    let contour = 0.85 + 0.15 * (std::f64::consts::TAU * escape_count(result) / 4.0).cos();
+    bytes(hsv(hue, 0.6, v * contour))
+}
+
+/// Hue from the direction of the iteration-weighted flame, saturation from its magnitude,
+/// darkened toward the boundary.
+fn flame(point: Complex<f64>, result: &MandelbrotResult, zoom: Complex<f64>) -> [u8; 4] {
+    if result.period != 0 {
+        return bytes_sqrt(classic_rgb(point, result, zoom));
+    }
+    let f = if result.flame_c.re.is_finite() && result.flame_c.im.is_finite() {
+        result.flame_c
+    } else {
+        result.flame_q
+    };
+    if !f.re.is_finite() || !f.im.is_finite() {
+        return bytes([0.3, 0.3, 0.3]);
+    }
+    let hue = f.arg() / std::f64::consts::TAU;
+    let sat = (f.norm() * 1.5).clamp(0.2, 1.0);
+    let v = 1.0 - 0.6 * (-de_pixels(result, zoom) / 2.0).exp();
+    bytes(hsv(hue, sat, v))
+}
+
+fn classic_rgb(point: Complex<f64>, result: &MandelbrotResult, zoom: Complex<f64>) -> [f64; 3] {
     let mut red: f64;
     let mut green: f64;
     let mut blue: f64;
@@ -127,9 +274,5 @@ pub fn calculate_colour(
         }
     }
 
-    let red_byte = ((red as f32).sqrt() * 256.) as u8;
-    let green_byte = ((green as f32).sqrt() * 256.) as u8;
-    let blue_byte = ((blue as f32).sqrt() * 256.) as u8;
-
-    [red_byte, green_byte, blue_byte, 255]
+    [red, green, blue]
 }
